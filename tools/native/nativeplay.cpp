@@ -148,11 +148,12 @@ std::vector<xg::nv::voice_cal> take_cals(mu2000 &mu, const u8 *rom, u32 rec,
 			const int att_ref = cal.has(9) ? (cal.reg[9] & 0xff) : mu.nvram()[0x3e96a];
 			const int rest = xg::nv::volume_rest(rom, el, note, vel);
 			const int fwl = xg::nv::fw_voice_level(mu.nvram().data(), ch);
-			cal.base_level =
-			    (fwl > 0 && xg::nv::volume_att_from(rom, fwl, rest,
-			                                        xg::nv::VOL_GAIN_DEF) == att_ref)
-			    ? xg::nv::base_level_from_fw(rom, el, fwl, note)
-			    : xg::nv::calibrate_level(rom, el, att_ref, note, vel);
+			const int mine = xg::nv::volume_level(rom, rec, el, note, 0);
+			cal.base_level = 0;
+			if (fwl >= 1 && fwl <= 127 && mine >= 1 && mine <= 127
+			    && xg::nv::volume_att_from(rom, fwl, rest,
+			                               xg::nv::VOL_GAIN_DEF) == att_ref)
+				cal.base_level = fwl - mine;
 		}
 		cal.have = true;
 		out.push_back(cal);
@@ -196,6 +197,10 @@ int main(int argc, char **argv)
 	bool levelcheck = false;
 	bool keycut = false;
 	bool nocal = false;
+	// **つまみを動かしてから鳴らす**（`--cc 7=40,10=20,91=100`）。
+	// 写し取りを捨てる（段 3）ために要る。既定のつまみのままなら
+	// `defaults` の実測値で合ってしまうので、動かした所でしか差が見えない
+	const char *ccs = nullptr;
 	const char *ramdump = nullptr;
 	for (int i = 3; i < argc; i++) {
 		if (!std::strcmp(argv[i], "-b") && i + 1 < argc)
@@ -229,6 +234,7 @@ int main(int argc, char **argv)
 		else if (!std::strcmp(argv[i], "--levelcheck")) levelcheck = true;
 		else if (!std::strcmp(argv[i], "--keycut")) keycut = true;
 		else if (!std::strcmp(argv[i], "--nocal")) nocal = true;
+		else if (!std::strcmp(argv[i], "--cc") && i + 1 < argc) ccs = argv[++i];
 		else if (!std::strcmp(argv[i], "--ramdump") && i + 1 < argc) ramdump = argv[++i];
 		else if (!std::strcmp(argv[i], "--catoff") && i + 1 < argc) catoff = int(std::strtol(argv[++i], nullptr, 0));
 		else if (!std::strcmp(argv[i], "--sweep") && i + 1 < argc) sweep = std::atoi(argv[++i]);
@@ -258,6 +264,23 @@ int main(int argc, char **argv)
 		mu.midi_in(b, 0);
 	for (u32 i = 0; i < RATE / 2; i++)
 		mu.run_sample(l, r);
+
+	// **つまみを動かしてから鳴らす**（`--cc 7=40,10=20`）。firmware に渡して
+	// 落ち着かせる。native 側は下で同じ値をワーク RAM から拾う
+	if (ccs) {
+		for (const char *p = ccs; *p; ) {
+			char *e = nullptr;
+			const long cc = std::strtol(p, &e, 10);
+			if (e == p) break;
+			long v = 0;
+			if (*e == '=') { p = e + 1; v = std::strtol(p, &e, 10); }
+			for (u8 b : { u8(0xb0), u8(cc & 0x7f), u8(v & 0x7f) })
+				mu.midi_in(b, 0);
+			p = (*e == ',') ? e + 1 : e;
+		}
+		for (u32 i = 0; i < RATE / 2; i++)
+			mu.run_sample(l, r);
+	}
 
 	const u8 *ram = mu.nvram().data();
 	const u32 part0 = xg::ram::part_base(0);
@@ -737,11 +760,13 @@ int main(int argc, char **argv)
 				ref = g.second;
 		if (ref < 0 && !got.empty())
 			ref = got[got.size() / 2].second;
-		const int base_lv = xg::nv::calibrate_level(rom, el0, ref, 60, vel);
-		std::printf("# 素の音量 = %d（鍵 60・強さ %d の減衰 %d から）%c", base_lv, vel, ref, 10);
+		const int base_lv = 0;
+		std::printf("# 素の目盛り = %d（ROM から。鍵 60・強さ %d の減衰 %d）%c",
+		            xg::nv::voice_raw_level(rom, rec, el0), vel, ref, 10);
 		int bad = 0, worst = 0;
 		for (const auto &g : got) {
-			const int mine = xg::nv::volume_att(rom, el0, base_lv, g.first, vel);
+			const int mine = xg::nv::volume_att(rom, rec, el0, g.first, vel,
+			                                    xg::nv::VOL_GAIN_DEF, base_lv);
 			const int d = mine - g.second;
 			if (d) bad++;
 			if (std::abs(d) > worst) worst = std::abs(d);
@@ -814,7 +839,7 @@ int main(int argc, char **argv)
 		for (int k = 0; k < nel; k++) {
 			const u8 *el = xg::nv::element(rom, rec, k);
 			const u8 *we0 = xg::nv::wave_entry(rom, xg::nv::wave_set(el),
-			                                   xg::nv::wave_note(el, 60));
+			                                   xg::nv::wave_note(rom, el, 60));
 			if (!we0)
 				continue;
 			const u32 wa0 = xg::nv::read_wave(we0).format_addr;
@@ -833,7 +858,7 @@ int main(int argc, char **argv)
 				for (int q = 0; q < 6; q++) {
 					got6[q] = -1;
 					const u8 *w3 = xg::nv::wave_entry(rom, xg::nv::wave_set(el),
-					                                  xg::nv::wave_note(el, KEYS[q]));
+					                                  xg::nv::wave_note(rom, el, KEYS[q]));
 					if (!w3)
 						continue;
 					const u32 wa3 = xg::nv::read_wave(w3).format_addr;
@@ -881,7 +906,7 @@ int main(int argc, char **argv)
 			for (int nn : { 36, 48, 60, 72, 84, 96 })
 				for (int vv : { 20, 60, 100, 127 }) {
 					const u8 *we2 = xg::nv::wave_entry(rom, xg::nv::wave_set(el),
-					                                   xg::nv::wave_note(el, nn));
+					                                   xg::nv::wave_note(rom, el, nn));
 					if (!we2)
 						continue;
 					const u32 wa = xg::nv::read_wave(we2).format_addr;
@@ -890,7 +915,8 @@ int main(int argc, char **argv)
 					if (it == mm.end())
 						continue;
 					const int got = it->second;
-					const int mine = xg::nv::volume_att(rom, el, base, nn, vv);
+					const int mine = xg::nv::volume_att(rom, rec, el, nn, vv,
+					                                    xg::nv::VOL_GAIN_DEF, base);
 					const int cv = xg::nv::level_key_curve(rom, el, nn);
 					const int wl = xg::nv::wave_level(rom, el, nn);
 					const int need = got / 2 - base - xg::nv::velocity_att(rom, vv)
@@ -1572,7 +1598,9 @@ int main(int argc, char **argv)
 						if (!xg::nv::element_active(el, 48 + v * 2, vel))
 							continue;
 						const xg::nv::voice_cal *c = cs.empty() ? nullptr : &cs[std::min(cs.size() - 1, size_t(k))];
-						const int att = xg::nv::volume_att(rom, el, c ? c->base_level : 64, 48 + v * 2, vel);
+						const int att = xg::nv::volume_att(rom, rec, el, 48 + v * 2, vel,
+						                                   xg::nv::VOL_GAIN_DEF,
+						                                   c ? c->base_level : 0);
 						poke_slot(mu, slot, xg::nv::build_note(rom, el, 48 + v * 2, att, c));
 						km |= u64(1) << slot;
 						slot++;
@@ -1649,7 +1677,9 @@ int main(int argc, char **argv)
 				const xg::nv::voice_cal *c = we ? xg::nv::match_cal(cals, xg::nv::read_wave(we).format_addr) : nullptr;
 				if (!c && size_t(used) < cals.size())
 					c = &cals[used];
-				const int att = xg::nv::volume_att(rom, el, c ? c->base_level : 64, note, vel);
+				const int att = xg::nv::volume_att(rom, rec, el, note, vel,
+				                                   xg::nv::VOL_GAIN_DEF,
+				                                   c ? c->base_level : 0);
 				poke_slot(mu, used, xg::nv::build_note(rom, el, note, att, c));
 				km |= u64(1) << used;
 				used++;
@@ -1939,8 +1969,9 @@ int main(int argc, char **argv)
 						c = &cals[used];
 					used++;
 					const int slot = (e.slot * 4 + k) & 0x3f;
-					const int att = xg::nv::volume_att(rom, el,
-					    c ? c->base_level : 64, e.note, vel);
+					const int att = xg::nv::volume_att(rom, rec, el, e.note, vel,
+					                                   xg::nv::VOL_GAIN_DEF,
+					                                   c ? c->base_level : 0);
 					if (e.on) {
 						poke_slot(mu, slot, xg::nv::build_note(rom, el, e.note, att, c));
 						keymask |= u64(1) << slot;
@@ -2002,7 +2033,8 @@ int main(int argc, char **argv)
 		if (!mu.load_state(before1.data(), before1.size(), err1)) { std::fprintf(stderr, "%s%c", err1.c_str(), 10); return 1; }
 		// ---- ここから SH-2 を止める
 		mu.set_cpu_enabled(false);
-		const int att = xg::nv::volume_att(rom, elem, cal.base_level, note, vel);
+		const int att = xg::nv::volume_att(rom, rec, elem, note, vel,
+		                                   xg::nv::VOL_GAIN_DEF, cal.base_level);
 		// --nocal: 写し取りを一切混ぜず、式だけで組む（段 3 の進み具合を測る）
 		xg::nv::slot_regs regs = xg::nv::build_note(rom, elem, note, att,
 		                                            nocal ? nullptr : &cal,

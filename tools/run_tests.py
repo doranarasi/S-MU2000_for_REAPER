@@ -24,6 +24,7 @@ ROM の置き場は --roms、環境変数 SMU2000_ROMS、roms/、../MU2000/roms 
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -254,12 +255,26 @@ def step_threading(rep, roms, first):
 
 # **波形の相関の下限**（試験ごと）。いま出ている値から少し余裕を引いたもの。
 # ここを下回ったら落ちる ＝ 形が崩れたら気づける。
-# porta と dense がまだ低いのは分かっている不具合（doc/native-engine.md の 6.82）
+# dense がまだ低いのは分かっている不具合（写し取りの音だけ、実機の側が
+# 混み具合で遅れる。doc/native-engine.md の 6.90）
 SHAPE_MIN = {
-    "piano":   0.98, "chord":  0.95, "drums": 0.85, "effects": 0.98,
-    "dense":   0.40, "port_b": 0.98, "bend":  0.98, "lofi":    0.98,
-    "egcc":    0.98, "porta":  0.38, "at":    0.95, "sxparam": 0.95,
-    "pedals":  0.95, "partsx": 0.95,
+    "piano":   0.98, "chord":  0.95, "drums": 0.95, "effects": 0.98,
+    "dense":   0.55, "port_b": 0.98, "bend":  0.98, "lofi":    0.98,
+    "egcc":    0.98, "porta":  0.95, "at":    0.95, "sxparam": 0.95,
+    "pedals":  0.95, "partsx": 0.95, "rpn": 0.95, "mono": 0.95,
+    # 一晩で足した軸（6.125-6.139）。どれも中央 98-100% 出ている
+    "ctlreset": 0.95, "ports": 0.95, "scale": 0.95, "kits": 0.95,
+    "ins2": 0.95, "progchg": 0.98, "running": 0.95, "pat": 0.95,
+    "ccramp": 0.95, "midreset": 0.98, "partmode": 0.95,
+    "drumnrpn": 0.95, "retrig": 0.95, "pedretrig": 0.98, "edges": 0.95,
+    "fxchange": 0.95, "dialloop": 0.95, "panrnd": 0.95,
+    # meter は 15 パートを同時に鳴らすので dense と同じ事情で形が落ちる
+    # （狙いは液晶のほうなので、音は緩めに見る）
+    "meter": 0.90, "filtcc": 0.95, "keyrange": 0.95, "rcvch": 0.95, "althh": 0.95, "drumrcv": 0.95,
+    # keylevel は鍵と強さで音量が大きく動く音色ばかりなので、鍵を押す時刻の
+    # ばらつき（6.90）が相関に出やすい。**音量のほうは `native の口` が見る**。
+    # 音 1 つずつは tools/native/notelevel.py で見られる
+    "keylevel": 0.95,
 }
 
 
@@ -383,6 +398,241 @@ def step_sampling(rep, roms):
     rep.add("sampling", rc == 0, note)
 
 
+def step_warm(rep, roms, cases):
+    """**2 回目以降の音**（写し取りが済んだ状態）。
+    `dense` の相関が 57% で止まっているのは、60 声のうち半分が
+    **写し取りの音（実機が鳴らす音）**で、firmware の混み具合が
+    firmware の道と違うため（doc/native-engine.md の 6.117・6.121）。
+    写し取りが済めばその音も native が鳴らすので、実際に使うときの値は
+    こちらになる。1 回鳴らして写しを貯め、2 回目を比べる"""
+    import math
+    home = WORK / "warmhome"
+    shutil.rmtree(home / "S-MU2000" / "voicecal", ignore_errors=True)
+    home.mkdir(parents=True, exist_ok=True)
+    env = {"LOCALAPPDATA": str(home), "XDG_DATA_HOME": str(home),
+           "HOME": str(home)}
+    extra = ["--native-engine", "--voicecache"]
+    # dense … 写し取りの音がいちばん効く曲、porta … 10ms 格子の位相を使う曲
+    # （写し取りが無いと位相が学べず、滑りが前の道に落ちていた。6.145）
+    floor = {"dense": 0.70, "porta": 0.95}
+    notes, bad = [], []
+    for name in ("dense", "porta"):
+        if name not in cases:
+            continue
+        midi, seconds = cases[name]
+        if render(roms, "warm1", midi, seconds, extra=extra, env=env)[0] is None:
+            bad.append("%s: 1 回目が鳴らせなかった" % name)
+            continue
+        if render(roms, "warm2", midi, seconds, extra=extra, env=env)[0] is None:
+            bad.append("%s: 2 回目が鳴らせなかった" % name)
+            continue
+        base = WORK / ("%s.wav" % name)
+        if not base.exists():
+            continue
+        fa, ra, ca, _ = fpmod.load_wav(str(base))
+        fb, _, cb, _ = fpmod.load_wav(str(WORK / "warm2.wav"))
+        n = min(len(fa) // ca, len(fb) // cb)
+        skip = int(round(BOOT_AT * ra))
+        cs = []
+        for s0 in range(skip, n - ra, ra):
+            sa = fa[s0 * ca:(s0 + ra) * ca:ca]
+            sb = fb[s0 * cb:(s0 + ra) * cb:cb]
+            na = sum(float(x) * x for x in sa)
+            nb = sum(float(x) * x for x in sb)
+            if na < 1e4 or nb < 1e4:
+                continue
+            num = sum(float(x) * float(y) for x, y in zip(sa, sb))
+            cs.append(num / math.sqrt(na * nb))
+        if not cs:
+            bad.append("%s: 音が無い" % name)
+            continue
+        med = sorted(cs)[len(cs) // 2]
+        notes.append("%s %.0f%%" % (name, 100 * med))
+        if med < floor.get(name, 0.9):
+            bad.append("%s %.0f%%" % (name, 100 * med))
+    rep.add("2 回目", not bad,
+            "、".join(bad or notes) + ("（下限を割った）" if bad else ""))
+
+
+def step_usb(rep, roms, cases):
+    """**USB の口でも native が firmware と同じ時刻で鳴るか**
+    （doc/native-engine.md の 6.120）。プラグインは USB が既定なのに、
+    native の口は MIDI のバイトを DIN の速さ（31250 baud ＝ 14.1 サンプル）で
+    並べていて、実機（19500 byte/s ＝ 2.26 サンプル）より 1 音あたり
+    37 サンプル遅れていた。試験はふだん DIN で鳴らすので気づけなかった"""
+    import math
+    env = {"SMU2000_NO_VOICECACHE": "1"}
+    notes, bad = [], []
+    # chord … USB のバイトの速さ、ports … 4 つの口（C と D は USB だけ）
+    for name in ("chord", "ports"):
+        if name not in cases:
+            continue
+        midi, seconds = cases[name]
+        a, _ = render(roms, "usb_fw", midi, seconds, extra=["--usb"], env=env)
+        b, _ = render(roms, "usb_ne", midi, seconds,
+                      extra=["--usb", "--native-engine"], env=env)
+        if a is None or b is None:
+            bad.append("%s: 鳴らせなかった" % name)
+            continue
+        fa, ra, ca, _ = fpmod.load_wav(str(WORK / "usb_fw.wav"))
+        fb, rb, cb, _ = fpmod.load_wav(str(WORK / "usb_ne.wav"))
+        n = min(len(fa) // ca, len(fb) // cb)
+        skip = int(round(BOOT_AT * ra))
+        cs = []
+        for s0 in range(skip, n - ra, ra):
+            sa = fa[s0 * ca:(s0 + ra) * ca:ca]
+            sb = fb[s0 * cb:(s0 + ra) * cb:cb]
+            na = sum(float(x) * x for x in sa)
+            nb = sum(float(x) * x for x in sb)
+            if na < 1e4 or nb < 1e4:
+                continue
+            num = sum(float(x) * float(y) for x, y in zip(sa, sb))
+            cs.append(num / math.sqrt(na * nb))
+        if not cs:
+            bad.append("%s: 音が無い" % name)
+            continue
+        med = sorted(cs)[len(cs) // 2]
+        notes.append("%s %.0f%%" % (name, 100 * med))
+        # ports は USB のとき、実機の側が**口ごとに違う遅れ**で鳴らす
+        # （口 A +43 に対し B +117・C +151・D +104 サンプル。まだ真似できて
+        # いない。doc/native-engine.md の 6.126）。DIN では 100% 出る
+        if med < (0.80 if name == "ports" else 0.95):
+            bad.append("%s %.0f%%" % (name, 100 * med))
+    rep.add("USB の口", not bad, "、".join(bad or notes) + ("（下限を割った）" if bad else ""))
+
+
+def step_meter(rep, roms):
+    """**液晶のメーター**（doc/native-engine.md の 6.148）。firmware の道と
+    native の口で同じ曲を鳴らして、**棒の字が並ぶ 16 マス**を突き合わせる。
+    メーターの目盛りは「強さ x パートの目盛り / 128」で、実機との差は 1 以内。
+    点の境目をまたぐと 1 マスだけずれることがあるので、2 マスまで許す"""
+    exe = tool("render")
+    mid = WORK / "meter.mid"
+    if not exe.exists() or not mid.exists():
+        rep.add("メーター", True, "この回では見ない")
+        return
+    got = {}
+    for tag, extra in (("fw", []), ("ne", ["--native-engine"])):
+        log = WORK / ("meter_%s.log" % tag)
+        rc = run([exe, roms, mid, WORK / ("meter_%s.wav" % tag), "5",
+                  "--boot", "%.3f" % BOOT_AT, "--lcd-at", "3.4"] + extra,
+                 out=log, err=log, env={"SMU2000_NO_VOICECACHE": "1"})
+        if rc != 0:
+            rep.add("メーター", False, "%s で鳴らせなかった" % tag)
+            return
+        hit = [l for l in log.read_text(encoding="utf-8", errors="replace").splitlines()
+               if l.startswith("LCDHEX")]
+        if not hit:
+            rep.add("メーター", False, "%s の液晶が読めなかった" % tag)
+            return
+        v = hit[0].split()[1:]
+        # 上の行の 1-8 桁目と下の行の 1-8 桁目
+        got[tag] = [v[1 + i] for i in range(8)] + [v[24 + 1 + i] for i in range(8)]
+    if all(x == "89" for x in got["fw"][8:]):
+        rep.add("メーター", False, "firmware の道で棒が動いていない")
+        return
+    if all(x == "89" for x in got["ne"][8:]):
+        rep.add("メーター", False, "native の口で棒が動かない")
+        return
+    bad = [i for i in range(16) if got["fw"][i] != got["ne"][i]]
+    ok = len(bad) <= 2
+    note = "16 マス中 %d マスが同じ" % (16 - len(bad))
+    if bad:
+        note += "（%s / %s）" % (" ".join(got["fw"]), " ".join(got["ne"]))
+    rep.add("メーター", ok, note)
+
+
+def step_dial(rep, roms, cases):
+    """**パネルのダイヤルで音色を替える**（doc/native-engine.md の 6.146）。
+    ジョグダイヤルの音色替えは MIDI を通らないので、native が拾えないと
+    「画面は変わるのに音が変わらない」。鳴らしている最中に 4 目盛り回して、
+    液晶と波形を firmware の道と突き合わせる"""
+    import math
+    exe = BUILD / ("panel" + EXE)
+    mid = WORK / "dialloop.mid"
+    if not exe.exists() or not mid.exists():
+        rep.add("ダイヤル", True, "この回では見ない")
+        return
+    lcd, wav = {}, {}
+    for tag, extra in (("fw", []), ("ne", ["--native"])):
+        out = WORK / ("dial_%s.wav" % tag)
+        log = WORK / ("dial_%s.log" % tag)
+        rc = run([exe, roms, "--keys", "play", "--mid", mid, "10",
+                  "--turn-at", "3.0", "4", "--wav", out] + extra, out=log, err=log)
+        if rc != 0 or not out.exists():
+            rep.add("ダイヤル", False, "%s で鳴らせなかった" % tag)
+            return
+        txt = log.read_text(encoding="utf-8", errors="replace").splitlines()
+        hit = [l for l in txt if l.startswith("  0 |")]
+        lcd[tag] = hit[0] if hit else ""
+        wav[tag] = out
+    if lcd["fw"] != lcd["ne"]:
+        rep.add("ダイヤル", False,
+                "液晶が違う: %s / %s" % (lcd["fw"].strip(), lcd["ne"].strip()))
+        return
+    fa, ra, ca, _ = fpmod.load_wav(str(wav["fw"]))
+    fb, _, cb, _ = fpmod.load_wav(str(wav["ne"]))
+    n = min(len(fa) // ca, len(fb) // cb)
+    cs = []
+    for s0 in range(0, n - ra, ra):
+        sa = fa[s0 * ca:(s0 + ra) * ca:ca]
+        sb = fb[s0 * cb:(s0 + ra) * cb:cb]
+        na = sum(float(x) * x for x in sa)
+        nb = sum(float(x) * x for x in sb)
+        if na < 1e3 or nb < 1e3:
+            continue
+        num = sum(float(x) * float(y) for x, y in zip(sa, sb))
+        cs.append(num / math.sqrt(na * nb))
+    if not cs:
+        rep.add("ダイヤル", False, "音が無い")
+        return
+    med = sorted(cs)[len(cs) // 2]
+    ok = med >= 0.95
+    rep.add("ダイヤル", ok, "音色が替わって波形の相関 %.0f%%" % (100 * med))
+
+
+# パネルの試験で押すボタン（品書きを一巡りする）
+PANEL_KEYS = ("play,util,enter,value+,value+,exit,edit,enter,value+,exit,exit,"
+              "part+,mute,play,drum,piano,organ,select,edit,enter,enter,exit,exit")
+
+
+def step_panel(rep, roms):
+    """**native の口でもパネルが効くか**（doc/native-engine.md の 6.119）。
+    ボタン・ダイヤル・液晶はぜんぶ firmware の仕事なので、firmware を細く
+    回したままだと一切効かない。同じボタンの並びを firmware の道と native の
+    口で押して、液晶が 1 行残らず同じになるかを見る"""
+    exe = BUILD / ("panel" + EXE)
+    if not exe.exists():
+        rep.add("パネル", False, "%s が無い" % exe)
+        return
+    outs = []
+    for tag, extra in (("fw", []), ("ne", ["--native"])):
+        log = WORK / ("panel_%s.log" % tag)
+        rc = run([exe, roms, "--keys", PANEL_KEYS, "--trace"] + extra,
+                 out=log, err=log)
+        if rc != 0:
+            rep.add("パネル", False, "%s で鳴らせなかった" % tag)
+            return
+        txt = log.read_text(encoding="utf-8", errors="replace").splitlines()
+        # `--trace` が出す「ボタン名 + 液晶 1 行」だけを取る
+        outs.append([l for l in txt if l.startswith("  ") and "|" in l])
+    if not outs[0]:
+        rep.add("パネル", False, "液晶が読めなかった")
+        return
+    bad = [i for i in range(min(len(outs[0]), len(outs[1])))
+           if outs[0][i] != outs[1][i]]
+    ok = not bad and len(outs[0]) == len(outs[1])
+    if ok:
+        note = "%d 行とも firmware と同じ" % len(outs[0])
+    elif bad:
+        note = "%d 行目から違う: %s / %s" % (bad[0] + 1,
+                                             outs[0][bad[0]].strip(),
+                                             outs[1][bad[0]].strip())
+    else:
+        note = "行数が違う（%d / %d）" % (len(outs[0]), len(outs[1]))
+    rep.add("パネル", ok, note)
+
+
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser()
@@ -446,6 +696,20 @@ def main():
         print()
         print("== 7. サンプリング（録音して試聴する）")
         step_sampling(rep, roms)
+
+        print()
+        print("== 8. パネル（native の口でもボタンと液晶が効くか）")
+        step_panel(rep, roms)
+        step_meter(rep, roms)
+        step_dial(rep, roms, cases)
+
+        print()
+        print("== 9. USB の口（プラグインの既定）")
+        step_usb(rep, roms, cases)
+
+        print()
+        print("== 10. 2 回目の音（写し取りが済んだ状態）")
+        step_warm(rep, roms, cases)
 
     rep.show()
     return 1 if rep.bad else 0

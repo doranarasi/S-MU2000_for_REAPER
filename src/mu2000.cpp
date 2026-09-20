@@ -3,6 +3,7 @@
 // MU2000 一台ぶんの組み立て。配置は MAME の ymmu2000.cpp と同じ。
 
 #include "mu2000.h"
+#include "lcdfont.h"
 
 #if defined(__SSE2__) || defined(_M_X64) || defined(__x86_64__)
 #include <xmmintrin.h>
@@ -23,6 +24,13 @@
 
 
 namespace {
+
+// 環境変数を読む（無ければ既定値）。調べもの用の窓で使う
+const char *getenv_or2(const char *name, const char *def)
+{
+	const char *v = std::getenv(name);
+	return v && *v ? v : def;
+}
 
 // MIDI は 31250bps。28MHz の CPU から見て 1 ビット = 896 サイクル
 constexpr u64 MIDI_BIT_CYCLES = 28000000 / 31250;
@@ -299,10 +307,14 @@ void mu2000::set_button(button b, bool pressed)
 	if (i < 0 || i >= int(button::count))
 		return;
 	const button_slot &s = BUTTONS[i];
+	const bool was = !BIT(m_sws[s.row], s.bit);
 	if (pressed)
 		m_sws[s.row] &= u8(~(1 << s.bit));
 	else
 		m_sws[s.row] |= u8(1 << s.bit);
+	// **押し離しが変わったときだけ**（毎こま同じ値で呼ばれても効かないように）
+	if (was != pressed)
+		panel_touched();
 }
 
 bool mu2000::button_pressed(button b) const
@@ -364,12 +376,6 @@ bool mu2000::load_lcd_font(const std::string &path)
 // そちらが優先される**。空いているところだけ埋める
 void mu2000::fill_missing_glyphs(std::vector<u8> &rom)
 {
-	auto blank = [&](int code) {
-		for (int y = 0; y < 8; y++)
-			if (rom[code * 16 + y] & 0x1f)
-				return false;
-		return true;
-	};
 	// 1 マスに 2 本。**バーの幅は 2 ドット**。左は 0-1 列、右は 3-4 列
 	auto bar = [&](int code, int left, int right) {
 		for (int y = 0; y < 8; y++) {
@@ -389,12 +395,57 @@ void mu2000::fill_missing_glyphs(std::vector<u8> &rom)
 	// 上の行と下の行で同じ表を使う。バーが上の行まで届かないときは
 	// その側が 0、全部消えているマスには空白 (0x20) が入る。
 	// 鳴っていないパートも 1 点だけ出る（a = b = 1、コード 0x89）
+	//
+	// **この範囲は ROM の中身より作り物を優先する**（doc/native-engine.md の
+	// 6.148）。`mulcd.zip` の字形 ROM は MU2000 自身のものではないらしく、
+	// この範囲で中身があるのは `87` `89` `C7` `CF` の 4 つだけ。うち
+	// `87`（右が満タン）`C7`（左が満タン）`CF`（両方満タン）は作り物と
+	// 1 ドット違わず同じだが、**`89` だけ違っていた**（ROM は `#.#.#`、
+	// 実機は `##.##`。実機の画面を見てもらって分かった）。
+	// `0x7f`（両方 0）は棒には使われず、普通の字として使われるので触らない
 	for (int a = 0; a <= 8; a++)
 		for (int b = 0; b <= 8; b++) {
-			const int code = 0x7f + a * 9 + b;
-			if (blank(code))
-				bar(code, a, b);
+			if (!a && !b)
+				continue;              // 0x7f は普通の字
+			bar(0x7f + a * 9 + b, a, b);
 		}
+
+	// **バンク No.・プログラム No. の前に出る右向きの三角**（利用者が実機を
+	// 撮ってくれた写真で分かった）。演奏画面の下の行は
+	//
+	//     11 30 30 30  10 30 30 31      ＝  ▶000 ▷001
+	//
+	// で、`0x11` がバンクの前、`0x10` がプログラムの前。**黒塗りが「ダイヤル
+	// で動く側」、白抜きが「固定されている側」**で、SELECT のボタンで入れ替わる。
+	// この画面は `0x11` が白抜き（バンクは固定）、`0x10` が黒塗り
+	// （プログラムが動く）＝ 利用者に GUI で見てもらって向きを確かめた。
+	//
+	// `mulcd.zip` の字形 ROM は MU2000 自身のものではないので、ここは
+	// **`0x10` が黒塗りの右向き・`0x11` が黒塗りの左向き**になっていた。
+	// 実機はどちらも右向きで、片方が白抜き
+	// 字形は利用者が実機を見て書き起こしたもの（**左に 1 列空く**）:
+	//
+	//     黒塗り        白抜き
+	//     .#...         .#...
+	//     .##..         .##..
+	//     .###.         .#.#.
+	//     .####         .#..#
+	//     .###.         .#.#.
+	//     .##..         .##..
+	//     .#...         .#...
+	//
+	// ここは**下敷き**で、`art/lcdfont.txt` があればそちらが上から被さる
+	// （手描きの字はぜんぶあちらに集める。src/lcdfont.h）
+	static const u8 TRI_FILLED[8] = { 0x08, 0x0c, 0x0e, 0x0f, 0x0e, 0x0c, 0x08, 0x00 };
+	static const u8 TRI_HOLLOW[8] = { 0x08, 0x0c, 0x0a, 0x09, 0x0a, 0x0c, 0x08, 0x00 };
+	for (int y = 0; y < 8; y++) {
+		rom[0x10 * 16 + y] = TRI_FILLED[y];
+		rom[0x11 * 16 + y] = TRI_HOLLOW[y];
+	}
+
+	// **手描きの字を上から被せる**（art/lcdfont.txt）。実機を見て描き起こした
+	// ものだけを入れる場所で、ROM から起こした字は入れない（src/lcdfont.h）
+	smu2000::lcdfont::overlay_default(rom);
 }
 
 void mu2000::set_lcd_font(u8rom p)
@@ -450,9 +501,28 @@ void mu2000::build_bus()
 		const u32 want = u32(std::strtoul(tp, nullptr, 16));
 		mem_bus::device d;
 		d.start = 0x400000; d.end = 0x43ffff;
-		auto note = [this, want](offs_t a, u32 v, int size) {
+		// SMU2000_RAMREADAT=<番地16進>[:<長さ16進>] で、**その範囲を読んだ命令の
+		// 番地**を出す（RAMWRITE の読み版。どの関数がその表を引いているかを探す）
+		u32 ra = 0xffffffffu, rlen = 1;
+		if (const char *rp = std::getenv("SMU2000_RAMREADAT")) {
+			char *end = nullptr;
+			ra = u32(std::strtoul(rp, &end, 16));
+			if (end && *end == ':')
+				rlen = u32(std::strtoul(end + 1, nullptr, 16));
+			if (!rlen)
+				rlen = 1;
+		}
+		// SMU2000_TRACE_S0 / _S1 で、**この標本の間だけ**出す（窓を絞る）
+		const u64 s0 = u64(std::strtoull(getenv_or2("SMU2000_TRACE_S0", "0"), nullptr, 10));
+		const u64 s1 = u64(std::strtoull(getenv_or2("SMU2000_TRACE_S1", "18446744073709551615"),
+		                                 nullptr, 10));
+		auto note = [this, want, ra, rlen, s0, s1](offs_t a, u32 v, int size) {
+			const u64 now = u64(trace_sample());
+			if (now < s0 || now > s1)
+				return;
 			const u32 pc = m_cpu ? m_cpu->pc() : 0;
-			if (pc >= want && pc <= want + 0x100)
+			if ((pc >= want && pc <= want + 0x100)
+			    || (a < ra + rlen && ra < a + u32(size)))
 				std::fprintf(stderr, "ramread s=%llu pc=%06x 番地=%06x = %x (%d bit)\n",
 				             (unsigned long long)trace_sample(),
 				             pc, u32(a), v, size * 8);
@@ -486,9 +556,10 @@ void mu2000::build_bus()
 		}
 		auto notew = [this, wa, wlen](offs_t a, u32 v, int size) {
 			if (a < wa + wlen && wa < a + u32(size))
-				std::fprintf(stderr, "ramwrite s=%llu pc=%06x 番地=%06x = %x (%d bit)\n",
+				std::fprintf(stderr, "ramwrite s=%llu pc=%06x pr=%06x 番地=%06x = %x (%d bit)\n",
 				             (unsigned long long)trace_sample(),
-				             m_cpu ? m_cpu->pc() : 0, u32(a), v, size * 8);
+				             m_cpu ? m_cpu->pc() : 0, m_cpu ? m_cpu->pr() : 0,
+				             u32(a), v, size * 8);
 		};
 		d.w8  = [this, notew](offs_t a, u8 v)  { notew(a, v, 1); m_ram[a - 0x400000] = v; };
 		d.w16 = [this, notew](offs_t a, u16 v) {
@@ -694,6 +765,15 @@ void mu2000::lcd_port_w(u16 data)
 				m_lcd.data_w(u8(data >> 8));
 			else
 				m_lcd.control_w(u8(data >> 8));
+			// **押したあと画面が動いている間は延ばす**（6.119）。ボタンを
+			// 押したあとの仕事が 0.5 秒で終わらないことがある（品書きの
+			// 読み込みなど）。書き換えが止まれば、すぐ細い回しに戻る。
+			// **触っていないときは延ばさない**。ここを「液晶が動いたら
+			// いつでも」にすると、曲を鳴らしている最中の表示更新でも
+			// firmware が全速になり、写し取りの中身まで変わってしまう
+			// （port_b 100% -> 97%、porta 81% -> 53%）
+			if (m_native_engine && m_panel_hold && m_panel_hold < LCD_RUN)
+				m_panel_hold = LCD_RUN;
 		}
 	}
 	m_pe = data;
@@ -1132,6 +1212,10 @@ void mu2000::set_native_engine(int mode)
 		c = 0;
 	for (part_prog &p : m_prog_sel)
 		p = part_prog();
+	for (s8 &m : m_part_mode)
+		m = -1;
+	for (auto &q : m_prog_seen)
+		q[0] = q[1] = q[2] = 0xff;
 	m_fw_note_total = 0;
 	m_fw_note_until = 0;
 	m_nq.clear();
@@ -1140,8 +1224,19 @@ void mu2000::set_native_engine(int mode)
 	for (traj_rec &t : m_trajs)
 		t = traj_rec();
 	m_ne_clock = 0;
+	// **液晶のメーターも初期化**（6.148）。つぎに描く時刻は m_ne_clock で
+	// 測っているので、戻さないと切り替えたあと動かなくなる
+	m_meter_next = 0;
+	for (u8 &v : m_meter_lv)
+		v = 0;
+	for (u8 &v : m_meter_smooth)
+		v = 0;
+	for (u8 &v : m_meter_cell)
+		v = 0;
 	for (u64 &t : m_rx_at)
 		t = 0;
+	m_rx_at_usb = 0;
+	m_rx_usb_port = -1;
 	std::memset(m_nown, 0, sizeof(m_nown));
 	for (nmidi &n : m_nmidi)
 		n = nmidi();
@@ -1153,6 +1248,7 @@ void mu2000::set_native_engine(int mode)
 	m_ne_by_learn.store(0, std::memory_order_relaxed);
 	m_ne_by_midi.store(0, std::memory_order_relaxed);
 	m_ne_by_keep.store(0, std::memory_order_relaxed);
+	m_ne_by_panel.store(0, std::memory_order_relaxed);
 	m_fw_why = 0;
 	m_ne_stats = native_stats();
 	if (!mode) {
@@ -1176,6 +1272,7 @@ void mu2000::set_native_engine(int mode)
 	// **チップの「音程の包絡線が着いた」印**を native の口にも見せる。
 	// 実機の firmware も内部レジスタ 4 の bit14 で同じものを見ている（0x12B81C）
 	m_ndrv.set_peg_peek([this](int chan) { return m_swpm.peg_reached(chan); });
+	m_ndrv.set_slot_peek([this](int chan) { return m_swpm.slot_active(chan); });
 }
 
 // 音色の 1 音目を firmware に鳴らさせて、スロットに書かれた値を写し取る
@@ -1214,6 +1311,10 @@ void mu2000::native_learn_start(u32 rec)
 		// 鍵を押したあとのフィルタ・LFO の動きを、時刻つきで控えておく
 		if (m_learn_key_clock) {
 			const int r2 = int(reg % 64);
+			// **10ms タイマの位相をここで学ぶ**（6.118）。実機が 0x00 を
+			// 書いた時刻そのものが、firmware の 10ms 割り込みの目
+			if (r2 == 0x00 && reg < 0x1000)
+				m_ndrv.set_eg_phase(u32(m_ne_clock));
 			if ((r2 == 0x00 || r2 == 0x01 || r2 == 0x04 || r2 == 0x05 || r2 == 0x0a) &&
 			    reg < 0x1000 && m_learn_traj.size() < 512)
 				m_learn_traj.push_back({ int(reg / 64),
@@ -1354,7 +1455,7 @@ void mu2000::native_learn_finish()
 					continue;
 				const u8 *e2 = xg::nv::element(rom, m_learn_rec, k);
 				const u8 *w2 = xg::nv::wave_entry(rom, xg::nv::wave_set(e2),
-				                                  xg::nv::wave_note(e2, learn_note_shifted()));
+				                                  xg::nv::wave_note(rom, e2, learn_note_shifted()));
 				if (w2 && xg::nv::read_wave(w2).format_addr == want) {
 					idx = k;
 					used_elem |= 1u << k;
@@ -1374,7 +1475,7 @@ void mu2000::native_learn_finish()
 			}
 			idx = int(cals.size()) < nel ? int(cals.size()) : 0;
 		}
-		// **音量の目盛りは実機の塊から直に取る**（6.102）。減衰の表は同じ値が
+		// **音量の目盛りは実機の塊から直に取る**（6.101）。減衰の表は同じ値が
 		// 3-4 段つづくので、減衰から目盛りを逆に引くと幅でしか分からない。
 		// 掛ける前の目盛りは実機がボイスの塊 +118 に持っているので、それを
 		// そのまま使えば当て推量が要らない。取れなければ逆引きに落とす
@@ -1389,14 +1490,18 @@ void mu2000::native_learn_finish()
 			const int fwl = xg::nv::fw_voice_level(m_ram.data(), ch);
 			// **検算**: 読んだ目盛りから組み直した減衰が、実機が書いた 0x09 と
 			// 合うか。合わなければ塊が別の声のものなので、逆引きに落とす
-			const bool good = fwl > 0 &&
-			    xg::nv::volume_att_from(rom, fwl, rest, gain) == att_ref;
-			cal.base_level = good
-			    ? xg::nv::base_level_from_fw(rom, el0, fwl, learn_note_shifted())
-			    : xg::nv::calibrate_level(rom, el0, att_ref, learn_note_shifted(),
-			                              learn_vel_sensed(), gain);
-			if (!good && fwl > 0)
-				m_ne_lvl_miss++;
+			// **目盛りは ROM から出す**（6.113）。ここで覚えるのは、実機の
+			// ボイスの塊 +118 とのずれだけ（普通は 0）。**頭打ち（0 か 128）に
+			// なっている鍵では差が取れない**ので、そのときは 0 のままにする
+			const int mine = xg::nv::volume_level(rom, m_learn_rec, el0,
+			                                      learn_note_shifted(), 0);
+			cal.base_level = 0;
+			if (fwl >= 1 && fwl <= 127 && mine >= 1 && mine <= 127
+			    && xg::nv::volume_att_from(rom, fwl, rest, gain) == att_ref) {
+				cal.base_level = fwl - mine;
+				if (cal.base_level)
+					m_ne_lvl_miss++;
+			}
 		}
 		// **減衰の目盛りのずれを覚える**。実機が書いた 0x07・0x08 の上位から
 		// 目盛りを引き直し、こちらの式で出した目盛りとの差を取る。
@@ -1444,19 +1549,20 @@ void mu2000::native_learn_finish()
 		for (int k = 0; k < ncal; k++) {
 			const xg::nv::voice_cal &c = cals[size_t(k)];
 			const u8 *e2 = xg::nv::element(rom, m_learn_rec, k);
-			const u8 *w2 = xg::nv::wave_entry(rom, xg::nv::wave_set(e2), xg::nv::wave_note(e2, m_learn_note));
+			const u8 *w2 = xg::nv::wave_entry(rom, xg::nv::wave_set(e2),
+			                                  xg::nv::wave_note(rom, e2, m_learn_note));
 						std::fprintf(stderr, "  写し%d 0x11=%04x 0x32=%04x 0x09=%04x 波形=%08x"
 			                     " / 式 0x11=%04x 要素b18=%d b0=%d b1=%d\n",
 			             k, c.reg[0x11], c.reg[0x32], c.reg[0x09], c.wave_addr(),
 			             w2 ? xg::nv::pitch_reg(xg::nv::read_wave(w2), m_learn_note,
-			                                    xg::nv::key_follow(e2), 0,
+			                                    xg::nv::key_follow(rom, e2), 0,
 			                                    xg::nv::key_pivot(e2)) : 0,
 			             e2[18], e2[0], e2[1]);
 			if (w2)
 				std::fprintf(stderr, "        こちらの波形=%08x 基準鍵=%d 微調=%d 上限鍵=%d 追従=%d 組=%d%s",
 				             xg::nv::read_wave(w2).format_addr, xg::nv::read_wave(w2).base_key,
 				             xg::nv::read_wave(w2).fine_cents, xg::nv::read_wave(w2).key_max,
-				             xg::nv::key_follow(e2), xg::nv::wave_set(e2), "\n");
+				             xg::nv::key_follow(rom, e2), xg::nv::wave_set(e2), "\n");
 		}
 	}
 	const u32 learn_ctx = cals.empty() ? 0 : cals[0].cal_ctx;
@@ -1663,6 +1769,8 @@ void mu2000::traj_watch(u32 reg, u16 value)
 		// LFO は「かけ始めるまでの間」や深さの増やし方を firmware がソフトでやっている
 		if (r != 0x00 && r != 0x01 && r != 0x04 && r != 0x05 && r != 0x0a)
 			continue;
+		if (r == 0x00)
+			m_ndrv.set_eg_phase(u32(m_ne_clock));
 		if (t.n >= 4096 || size_t(t.chan[ch]) >= t.cals->size())
 			continue;
 		// **その場で**写し取りに足す。いま鳴っている native の音も、
@@ -1719,12 +1827,97 @@ void mu2000::traj_finish_one(int i)
 // バンクとプログラムから音色の記録を引いて、native の口に渡す。
 // firmware がワーク RAM に入れるのを待たなくて済む（引き方は
 // xg::voice_rom::lookup。旋律系のバンク 640 音色で firmware と食い違い 0）
+
+// **液晶のメーターを自分で描く**（doc/native-engine.md の 6.148）。
+//
+// 実機は「演奏画面を描く係」（ROM 0x0D1340）でメーターを描いているが、
+// これは **firmware が自分で音を持っている間しか呼ばれない**（実測。
+// firmware を全速で回しても、native が鳴らしているだけでは走らない）。
+// だから native の口では、棒の字を液晶へ直に置く。
+//
+// 並びは実機を見て割り出した:
+//   * 下の行の 1-8 桁目が 8 マス。1 マスに **2 パート**（左＝偶数、右＝奇数）
+//   * 上の行の同じ桁は、棒が 8 点を越えたぶん。両方 0 なら空白
+//   * 字のコードは 0x7f + 9a + b（a・b は 0-8 点。mu2000::fill_missing_glyphs）
+//   * 点の数は **目盛り / 8 + 1**（鳴っていないパートも 1 点出る）
+void mu2000::draw_meter()
+{
+	const u8 *cur = m_lcd.ddram();
+	// **触ってよいのは次の 2 つだけ**:
+	//   * こちらが前に書いた値がそのまま残っているマス
+	//   * firmware が置いた「鳴っていない」形（下 0x89 / 上 空白）
+	// どれか 1 つでも当てはまらなければ、**1 マスも触らない**。
+	// 別の画面では同じ桁に文字が出ていて、消すと表示が壊れる
+	if (cur[0x40] != 0x89)
+		return;
+	// **上と下は別々に見る**。演奏画面には「上の行が棒の続きではなく数字」の
+	// 形もあって（パネルで `play` を押したあとの画面）、まとめて見ると
+	// 下の棒まで描けなくなる
+	bool lo_ok = true, hi_ok = true;
+	for (int c = 1; c <= 8; c++) {
+		const u8 lo = cur[0x40 + u32(c)], hi = cur[u32(c)];
+		// 下の行は**棒の字ならこちらのものとして引き取る**。実機モードから
+		// 戻ったとき、firmware が最後に描いた棒がそのまま残っていることが
+		// あって、`0x89`（鳴っていない形）だけを待っていると二度と描けない
+		if (lo != m_meter_cell[c - 1] && (lo < 0x7f || lo > 0xd0))
+			lo_ok = false;
+		if (hi != m_meter_cell[8 + c - 1] && hi != 0x20)
+			hi_ok = false;
+	}
+	if (!lo_ok)
+		return;
+	for (int c = 1; c <= 8; c++) {
+		const int l = int(m_meter_smooth[(c - 1) * 2]) / 8 + 1;
+		const int r = int(m_meter_smooth[(c - 1) * 2 + 1]) / 8 + 1;
+		const int lb = l > 8 ? 8 : l, rb = r > 8 ? 8 : r;
+		const int lt = l > 8 ? (l - 8 > 8 ? 8 : l - 8) : 0;
+		const int rt = r > 8 ? (r - 8 > 8 ? 8 : r - 8) : 0;
+		const u8 lo = u8(0x7f + lb * 9 + rb);
+		const u8 hi = (lt || rt) ? u8(0x7f + lt * 9 + rt) : u8(0x20);
+		m_lcd.poke_ddram(u32(0x40 + c), lo);
+		m_meter_cell[c - 1] = lo;
+		if (hi_ok) {
+			m_lcd.poke_ddram(u32(c), hi);
+			m_meter_cell[8 + c - 1] = hi;
+		}
+	}
+}
+
+// **パネルで替えられた音色を拾う**（6.146）。ジョグダイヤルや PART+/- の
+// 音色替えは MIDI を通らないので、こちらが持っている `m_prog_sel` が古い
+// ままになり、**画面は変わるのに音が変わらない**（実機モードへ行って戻ると
+// 直るのは、そこで選びが作り直されるため）。
+//
+// ワーク RAM の値が**前に見たときから動いていたら**拾う。こちらが MIDI で
+// 動かしたぶんは firmware が同じ値を書くので、二重には効かない
+void mu2000::sync_prog()
+{
+	if (m_ram.size() < xg::ram::PARTS)
+		return;
+	for (int p = 0; p < 64; p++) {
+		const u32 b = xg::ram::part_base(p);
+		if (b + 4 > m_ram.size())
+			continue;
+		const u8 msb = m_ram[b + 1], lsb = m_ram[b + 2], prog = m_ram[b + 3];
+		u8 *seen = m_prog_seen[p];
+		if (seen[0] == msb && seen[1] == lsb && seen[2] == prog)
+			continue;
+		seen[0] = msb; seen[1] = lsb; seen[2] = prog;
+		part_prog &sel = m_prog_sel[p];
+		if (sel.msb == msb && sel.lsb == lsb && sel.prog == prog)
+			continue;                    // MIDI で先に効かせてあった
+		sel.msb = msb; sel.lsb = lsb; sel.prog = prog;
+		native_select_voice(p);
+	}
+}
+
 void mu2000::native_select_voice(int part)
 {
 	if (part < 0 || part >= 64 || !m_prog)
 		return;
 	const part_prog &p = m_prog_sel[part];
-	const bool drum = (p.msb == 127 || p.msb == 126);
+	// バンク 127/126 だけでなく、**パートの種類**（08 pp 07）でもドラムになる
+	const bool drum = (p.msb == 127 || p.msb == 126) || part_is_drum(part);
 	if (drum) {
 		m_ndrv.set_record(part, 0, 1);
 		return;
@@ -1744,11 +1937,29 @@ void mu2000::native_select_voice(int part)
 // firmware を 100ms につき 5ms しか回さないので、その遅れは 1 秒を超える
 void mu2000::native_sysex(u64 fire)
 {
+	// **リセットは native にも効かせる**（6.136）。GM システムオン
+	// （7E 7F 09 xx）・GS リセット（41 1n 42 12 40 00 7F）・XG システムオン
+	// （43 1n 4C 00 00 7E/7F）。パートの状態も音色の選びも既定に戻るので、
+	// こちらも戻さないと古い音色・古いつまみで鳴り続ける。
+	// **ヤマハの判定より前に見る**（GM と GS は 43 で始まらない）
+	if (m_sx_pos >= 3 && m_sx[0] == 0x7e && m_sx[2] == 0x09) {
+		m_nq.push_back({ fire, 6, 0, 0, 0 });
+		return;
+	}
+	if (m_sx_pos >= 7 && m_sx[0] == 0x41 && m_sx[2] == 0x42 &&
+	    m_sx[4] == 0x40 && m_sx[6] == 0x7f) {
+		m_nq.push_back({ fire, 6, 0, 0, 0 });
+		return;
+	}
 	if (m_sx_pos < 7)
 		return;
 	if (!(m_sx[0] == 0x43 && (m_sx[1] & 0xf0) == 0x10 && m_sx[2] == 0x4c))
 		return;
 	const u8 hh = m_sx[3], mm = m_sx[4], ll = m_sx[5];
+	if (hh == 0x00 && mm == 0x00 && (ll == 0x7e || ll == 0x7f)) {
+		m_nq.push_back({ fire, 6, 0, 0, 0 });
+		return;
+	}
 	if (hh != 0x08 || mm >= 32)
 		return;
 	// **1 回の SysEx で続けて何バイトも書ける**（ll から順に並ぶ）
@@ -1795,7 +2006,28 @@ void mu2000::native_pump()
 			break;
 		// XG のパートの設定（08 pp ll）。ワーク RAM の並びと同じなので、
 		// 番地をそのまま渡す
-		case 5: m_ndrv.set_part_param(e.part, e.d0, e.d1); break;
+		case 5:
+			m_ndrv.set_part_param(e.part, e.d0, e.d1);
+			// **パートの種類が変わったら音色を引き直す**（6.137）
+			if (e.d0 == 0x07 && e.part < 64) {
+				m_part_mode[e.part] = s8(e.d1);
+				native_select_voice(e.part);
+			}
+			break;
+		// リセット（6.136）。音色の選びもパートの状態も既定に戻す
+		case 6:
+			for (int p = 0; p < 64; p++) {
+				m_prog_sel[p] = part_prog();
+				m_part_mode[p] = -1;
+				m_prog_seen[p][0] = m_prog_seen[p][1] = m_prog_seen[p][2] = 0xff;
+			}
+			std::memset(m_nown, 0, sizeof(m_nown));
+			m_ndrv.reset_parts();
+			// **音色の記録も引き直す**。m_prog_sel を戻すだけでは、
+			// 口が持っている記録（`set_record`）が古いままになる
+			for (int p = 0; p < 64; p++)
+				native_select_voice(p);
+			break;
 		default: break;
 		}
 	}
@@ -1906,7 +2138,17 @@ bool mu2000::native_midi(u8 byte, int port)
 	const u8 kind = n.status & 0xf0;
 	// 音色の指定（1 バイト）。自分で記録を引いて、firmware にも渡す
 	if (kind == 0xc0) {
-		const int part2 = (n.status & 0x0f) + port * 16;
+		const int part2 = m_ndrv.rcv_part(port, n.status & 0x0f);
+		if (part2 < 0) {          // 聞いているパートが無い／2 つ以上（6.150）
+			m_ne_stats.other++;
+			m_fw_hold = std::max(m_fw_hold, u32(44100 / 50));
+			const int save3 = m_native_engine;
+			m_native_engine = 0;
+			midi_in(n.status, port);
+			midi_in(byte, port);
+			m_native_engine = save3;
+			return true;
+		}
 		m_nq.push_back({ fire, 4, u8(part2), 2, u8(byte & 0x7f) });
 		m_ne_stats.other++;
 		// 記録はこちらで引けたが、firmware も自分の下ごしらえに時間が要る
@@ -1929,7 +2171,17 @@ bool mu2000::native_midi(u8 byte, int port)
 		return true;
 	}
 	n.have = 0;
-	const int part = (n.status & 0x0f) + port * 16;
+	// **受信チャンネル**（08 pp 04。6.150）。既定はパート = チャンネル + 口 x 16
+	// だが、曲が付け替えることがある。聞いているパートが無いときは実機も
+	// 黙るので何もせず、2 つ以上のときは重ねて鳴るので firmware に任せる
+	const int part = m_ndrv.rcv_part(port, n.status & 0x0f);
+	if (part < 0) {
+		m_ne_stats.other++;
+		if (part == -2)
+			m_fw_hold = std::max(m_fw_hold, u32(44100 / 50));
+		replay_note(n.status, n.d0, byte, port);
+		return true;
+	}
 
 	// ピッチベンドは、音程のレジスタを自分で作れるので firmware には渡さない。
 	// ただし、そのパートで firmware が鳴らしている音がある間は渡す
@@ -1969,9 +2221,12 @@ bool mu2000::native_midi(u8 byte, int port)
 	}
 	const int note = n.d0 & 0x7f, vel = byte & 0x7f;
 	if (kind == 0x80 || vel == 0) {
+		// **離しは押しと処理時間が違う**（SMU2000_OFF_PROC）。実機は
+		// ドラムの離しを最後のバイトの次のサンプルで書いていた
+		const u64 fire_off = fire - native_proc64() / 64 + off_proc64() / 64;
 		if (nown(part, note)) {
 			nown_set(part, note, false);
-			m_nq.push_back({ fire, 0, u8(part), u8(note), u8(vel) });
+			m_nq.push_back({ fire_off, 0, u8(part), u8(note), u8(vel) });
 			return true;
 		}
 		// native で鳴っていない音は firmware に任せる
@@ -1984,9 +2239,24 @@ bool mu2000::native_midi(u8 byte, int port)
 		replay_note(n.status, u8(note), u8(vel), port);
 		return true;
 	}
+	// **鍵の範囲の外は鳴らさない**（08 pp 0F/10）。実機も鳴らさないので、
+	// firmware には渡すだけにして、こちらでは 1 音も出さない。
+	// **押しを受けないドラム**（3n rr 0A = 0）も同じ（6.151）
+	if (!m_ndrv.note_in_range(part, note)
+	    || (m_ndrv.is_drum(part) && !m_ndrv.drum_rcv_note_on(part, note))) {
+		m_ne_stats.other++;
+		replay_note(n.status, u8(note), u8(vel), port);
+		return true;
+	}
 	if (m_ndrv.can_play(part, note)) {
 		nown_set(part, note, true);
-		m_nq.push_back({ fire, 1, u8(part), u8(note), u8(vel) });
+		// **ドラムは実機のほうが 3 サンプル早い**（6.139）。旋律は +1 で
+		// 合っているのに、打楽器だけ +3 になる。1 打を引く道が短いためと
+		// 見ている（`SMU2000_DRUM_LEAD` で振れる）。打楽器は立ち上がりが
+		// 鋭いので、2 サンプルでも波形の相関がはっきり変わる
+		const u64 at = (part_is_drum(part) && fire > drum_lead())
+		             ? fire - drum_lead() : fire;
+		m_nq.push_back({ at, 1, u8(part), u8(note), u8(vel) });
 		return true;
 	}
 	m_ne_stats.note_fw++;
@@ -2242,10 +2512,41 @@ void mu2000::run_sample(s32 &left, s32 &right)
 			m_fw_hold = std::max(m_fw_hold, KEEPALIVE_RUN);
 			if (!m_fw_why)
 				m_fw_why = 5;
+			// **つまみを 100ms ごとに必ず拾い直す**（6.125）。下の
+			// 「hold が 0 になったら」だけでは、firmware が音を鳴らしている
+			// 間（m_fw_note_total）や写し取りの録画中は hold が 0 に
+			// ならないので、**一度も拾えない**ことがあった。RPN でベンド幅を
+			// 広げても native は既定の 2 半音のまま鳴らしていた
+			m_ndrv.sync_cc();
+			sync_prog();
+		}
+		// **パネルを触っている間は全速**（6.119）。ボタン・ダイヤル・液晶は
+		// ぜんぶ firmware の仕事なので、細く回したままだと手触りが 20 分の 1 に
+		// なる。ダイヤルの目盛りが残っている間も回し続ける（実機は 2.5ms ごとに
+		// 1 目盛りしか読まないので、止めると入力が溜まったままになる）
+		if (m_panel_hold || m_enc_pending) {
+			if (m_panel_hold)
+				m_panel_hold--;
+			m_fw_hold = std::max(m_fw_hold, u32(2));
+			if (!m_fw_why)
+				m_fw_why = 6;
 		}
 		// 「溜まっている間は回す」はやめた。渡した MIDI は 1 バイト 14 サンプルかけて
 		// 線を流れるので、それを待つだけで実時間の 2 割を SH-2 に持っていかれていた。
 		// メッセージごとに置く待ち（下の native_midi）で足りる
+		// **液晶のメーターは 25ms ごと**（6.148）。実機の 0x0D158A と同じ刻み・
+		// 同じ式（半分ずつ寄せる）。1 音鳴らしたときの
+		// 39→58→68→73→75→76→77 がこれで出る
+		if (m_ne_clock >= m_meter_next) {
+			m_meter_next = m_ne_clock + 44100 / 40;
+			m_ndrv.fill_meter(m_meter_lv, 16);
+			for (int p = 0; p < 16; p++) {
+				const int now = int(m_meter_smooth[p]);
+				const int tgt = int(m_meter_lv[p]);
+				m_meter_smooth[p] = u8(now + (tgt - now) / 2);
+			}
+			draw_meter();
+		}
 		if (m_fw_hold) {
 			if (--m_fw_hold == 0) {
 				// つまみの位置を RAM から取り直す。こちらが動かした値は
@@ -2254,7 +2555,10 @@ void mu2000::run_sample(s32 &left, s32 &right)
 				m_ndrv.sync_cc();
 				m_fw_why = 0;
 			}
-		} else {
+		// `SMU2000_FW_ALWAYS=1` で **native の口でも SH-2 を止めない**。
+		// 止めると firmware の打鍵が 1 サンプル後ろへずれるのを見つけた
+		// ときの道具（doc/native-engine.md の 6.153）。ふだんは使わない
+		} else if (!std::getenv("SMU2000_FW_ALWAYS")) {
 			run_cpu = false;
 		}
 		if (run_cpu) {
@@ -2269,11 +2573,24 @@ void mu2000::run_sample(s32 &left, s32 &right)
 				m_ne_by_midi.fetch_add(1, std::memory_order_relaxed);
 			else if (m_fw_why == 5)
 				m_ne_by_keep.fetch_add(1, std::memory_order_relaxed);
+			else if (m_fw_why == 6)
+				m_ne_by_panel.fetch_add(1, std::memory_order_relaxed);
 			else
 				m_ne_by_other.fetch_add(1, std::memory_order_relaxed);
 		}
 		if (m_learning && m_learn_left && --m_learn_left == 0)
 			native_learn_finish();
+		// **10ms 割り込みの印を見て格子の位相を学ぶ**（6.145）。
+		// 写し取りの `0x00` からしか学べなかったので、写し取り済み
+		// （2 回目以降）だと一度も学べず、滑りが前の道に落ちていた。
+		// firmware は音を鳴らしていなくてもここを裏返すので、いつでも学べる
+		if (m_ram.size() > xg::ram::TICK_MARK) {
+			const u8 tk = m_ram[xg::ram::TICK_MARK];
+			if (tk != m_tick_seen) {
+				m_tick_seen = tk;
+				m_ndrv.set_eg_phase(u32(m_ne_clock));
+			}
+		}
 		m_ne_clock++;
 		if (!m_nq.empty())
 			native_pump();

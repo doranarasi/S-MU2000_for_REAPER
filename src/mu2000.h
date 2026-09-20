@@ -296,7 +296,11 @@ public:
 	// firmware は 2.5ms ごとにここを読み、**A が立っていれば 1 目盛り**、
 	// 向きは B（0 で増、1 で減）で決める。実測でそう決まっている。
 	// 走査 1 回につき 1 目盛りなので、最大 400 目盛り/秒
-	void turn_encoder(int detents) { m_enc_pending += detents; }
+	void turn_encoder(int detents)
+	{
+		m_enc_pending += detents;
+		panel_touched();
+	}
 	bool encoder_busy() const { return m_enc_pending != 0; }
 
 	// パネルの LED 10 個。MAME の mulcd_device::set_leds と同じ並び
@@ -325,6 +329,7 @@ public:
 	std::atomic<u64> m_ne_by_learn{0};   // 写し取り（その音色の 1 音目）
 	std::atomic<u64> m_ne_by_midi{0};    // 渡した MIDI を受け取らせている
 	std::atomic<u64> m_ne_by_keep{0};    // 止めきらないために細く回している
+	std::atomic<u64> m_ne_by_panel{0};   // パネル（ボタン・ダイヤル・液晶）を触っている
 	u8   m_fw_why = 0;                   // いまの hold の理由（1 SysEx / 2 そのほか）
 	// SysEx の頭を少し覚えて、長く回す必要があるかを見分ける
 	int  m_sx_pos = -1;
@@ -402,6 +407,19 @@ private:
 	// 実機の遅れは 72 と 73 を行き来する ＝ 端数がある。整数で足していた
 	// ころは必ず 73 になり、1 サンプルずれる音が出ていた（doc の 6.92）。
 	// `SMU2000_NATIVE_PROC` で振れる（1/64 サンプル単位）
+	// **離しの処理にかかる時間**（1/64 サンプル）。押しとは別に持つ。
+	//
+	// 押しは 32 サンプル（音色を引いて要素を組み立てる）かかるが、
+	// **離しは 2 サンプル**だった。実機は最後のバイトを受けてすぐ 0x09 を
+	// 書いている。押しと同じ 32 にしていたので、**すべての離しが
+	// 30 サンプル遅れていた**（旋律もドラムも同じだけ遅れる。
+	// doc/native-engine.md の 6.152）。`SMU2000_OFF_PROC` で振れる
+	static u32 off_proc64()
+	{
+		static const u32 v = std::getenv("SMU2000_OFF_PROC")
+		                   ? u32(std::atoi(std::getenv("SMU2000_OFF_PROC"))) : 2 * 64;
+		return v;
+	}
 	static u32 native_proc64()
 	{
 		static const u32 v = std::getenv("SMU2000_NATIVE_PROC")
@@ -409,19 +427,52 @@ private:
 		return v;
 	}
 	// 1 バイト（1/64 サンプル単位）。`SMU2000_RX_BYTE` で振れる（0 にすると
-	// 和音の音が全部同じ時刻に出る。相対のずれを調べる用。doc の 6.78）
+	// 和音の音が全部同じ時刻に出る。相対のずれを調べる用。doc の 6.78）。
+	// **DIN は 31250 baud で 1 バイト 10 ビット ＝ 14.1 サンプル**、
+	// **USB は実機で測った 19500 byte/s ＝ 2.26 サンプル**（doc/dump/usb.md）。
+	// USB の口なのに DIN の速さで並べていたので、プラグイン（USB が既定）では
+	// 音が 1 つにつき 37 サンプル遅れていた（doc/native-engine.md の 6.120）
 	static u64 rx_byte_tick()
 	{
 		static const u64 v = std::getenv("SMU2000_RX_BYTE")
 		                   ? u64(std::atoi(std::getenv("SMU2000_RX_BYTE"))) : 903;
 		return v;
 	}
+	// **線の刻みは 1/8000 サンプルで数える**（doc/native-engine.md の 6.156）。
+	// DIN の 1 バイトは 10 ビット / 31250 baud ＝ 28MHz で 8960 サイクル ＝
+	// **ちょうど 14.112 サンプル**。1/64 では割り切れず（903.168）、
+	// 切り捨てていたぶんが溜まって和音の 2 音目から 1 サンプル遅れていた。
+	// 1/8000 なら 112896 でぴったり合う（USB の 2.265625 サンプルも 18125）
+	static constexpr u64 RX_UNIT = 8000;
+	static constexpr u64 RX_SCALE = RX_UNIT / 64;      // 1/64 → 1/8000
+	static u64 rx_byte_tick8()
+	{
+		static const u64 v = std::getenv("SMU2000_RX_BYTE")
+		                   ? rx_byte_tick() * RX_SCALE : 112896;
+		return v;
+	}
+	static u64 rx_byte_tick_usb8() { return rx_byte_tick_usb() * RX_SCALE; }
+	static u64 usb_sub8() { return usb_sub64() * RX_SCALE; }
+	// 押しの処理時間。`SMU2000_NATIVE_PROC8` なら 1/8000 サンプルで振れる
+	static u64 native_proc8()
+	{
+		static const u64 v = std::getenv("SMU2000_NATIVE_PROC8")
+		                   ? u64(std::atoi(std::getenv("SMU2000_NATIVE_PROC8")))
+		                   : u64(native_proc64()) * RX_SCALE;
+		return v;
+	}
 	u64  m_rx_at[MIDI_PORTS] = {};                   // その口が次のバイトを受け終える時刻
+	u64  m_rx_at_usb = 0;                            // USB の線（4 口で分け合う）
+	u8   m_tick_seen = 0xff;                         // 10ms の印の前の値（6.145）
+	int  m_rx_usb_port = -1;                         // USB で最後に選んだ口
 	// kind 0=離し 1=押し 2=CC 3=ベンド 4=音色の指定 5=XG のパートの設定（08 pp d0=d1）
 	struct nev { u64 at; u8 kind, part, d0, d1; };
 	std::deque<nev> m_nq;
 	u64  m_ne_clock = 0;
-	u32  m_nown[64][4] = {};       // native で鳴らしている鍵（パートごとに 128 ビット）
+	// **native で鳴らしている鍵の数**（パート x 鍵）。ビット 1 つだと、
+	// 同じ鍵を重ねて押されたとき（キーアサインがマルチの曲）2 回目以降の
+	// 離しを取りこぼし、その音だけ鳴り残る（doc/native-engine.md の 6.149）
+	u8   m_nown[64][128] = {};
 
 	void native_pump();
 	// 写し取った音の、フィルタの動きを録る（doc/native-engine.md の 6.17）
@@ -469,26 +520,94 @@ private:
 	static constexpr int TRAJ_TRIES  = 4;
 	std::map<u64, int> m_traj_tries;
 	// そのバイトを受け終える時刻を進めて、鳴らすべき時刻（サンプル）を返す
+	// その口のバイトが USB を通るか（midi_in の振り分けと同じ見立て）
+	bool rx_usb(int port) const
+	{
+		return m_usb_host || m_cable[port] >= MIDI_DIN_PORTS;
+	}
+	static u64 usb_sub64()
+	{
+		static const u64 v = std::getenv("SMU2000_USB_SUB")
+		                   ? u64(std::atoi(std::getenv("SMU2000_USB_SUB"))) : 6 * 64;
+		return v;
+	}
+	static u64 rx_byte_tick_usb()
+	{
+		static const u64 v = std::getenv("SMU2000_RX_BYTE_USB")
+		                   ? u64(std::atoi(std::getenv("SMU2000_RX_BYTE_USB"))) : 145;
+		return v;
+	}
 	u64 rx_advance(int port)
 	{
-		const u64 now = m_ne_clock * 64;
-		if (m_rx_at[port] < now)
-			m_rx_at[port] = now;
-		m_rx_at[port] += rx_byte_tick();
-		return (m_rx_at[port] + native_proc64()) / 64;
+		const u64 now = m_ne_clock * RX_UNIT;
+		// **USB は 4 つの口が 1 本の線を分け合う**（doc/native-engine.md の 6.126）。
+		// DIN は口ごとに別の線なので別々に数えるが、USB では口 A のバイトが
+		// 口 C のバイトを待たせる。口ごとに数えていたので、口 B・C・D の音が
+		// 実機より 80-94 サンプル早く出ていた
+		const bool usb = rx_usb(port);
+		u64 &at = usb ? m_rx_at_usb : m_rx_at[port];
+		if (at < now)
+			at = now;
+		// **口が変わると `F5 <口>` が 2 バイト挟まる**（usb_midi_in と同じ）。
+		// 数えていないと、口をまたぐ曲でこちらだけ早く鳴る
+		if (usb && port != m_rx_usb_port) {
+			m_rx_usb_port = port;
+			at += 2 * rx_byte_tick_usb8();
+		}
+		at += usb ? rx_byte_tick_usb8() : rx_byte_tick8();
+		// **USB の口 B・C・D は実機のほうが 6 サンプル遅い**（6.129）。
+		// 口 A は合っている。DIN では 4 口とも同じなので、USB のときだけ。
+		// 1 口だけ使う曲を 4 通り作って測った（`SMU2000_USB_SUB` で振れる）。
+		// **`--bootcache` で測ってはいけない**。そちらだと 76 サンプルに
+		// 見えるが、ほんとうに起動させると 6 だった（6.121 と同じ罠）
+		const u64 extra = (usb && port > 0) ? usb_sub8() : 0;
+		return (at + extra + native_proc8()) / RX_UNIT;
 	}
-	bool nown(int part, int note) const
-	{ return (m_nown[part][(note >> 5) & 3] & (u32(1) << (note & 31))) != 0; }
+
+	bool nown(int part, int note) const { return m_nown[part][note & 0x7f] != 0; }
 	void nown_set(int part, int note, bool on)
 	{
-		if (on) m_nown[part][(note >> 5) & 3] |= u32(1) << (note & 31);
-		else    m_nown[part][(note >> 5) & 3] &= ~(u32(1) << (note & 31));
+		u8 &n = m_nown[part][note & 0x7f];
+		if (on) { if (n < 255) n++; }
+		else    { if (n) n--; }
 	}
 
 	// **音色を自分で引く**（firmware の RAM を待たずに済む）。
 	// バンクとプログラムをパートごとに覚えて、xg::voice_rom::lookup に渡す
 	struct part_prog { u8 msb = 0, lsb = 0, prog = 0; };
 	part_prog m_prog_sel[64];
+	// **前に見たワーク RAM のバンクと音色**（パートの塊 +1/+2/+3）。
+	// パネルのダイヤルや PART+/- で音色を替えると MIDI を通らないので、
+	// ここを見張って拾い直す（doc/native-engine.md の 6.146）。
+	// 0xff は「まだ見ていない」
+	u8 m_prog_seen[64][3];
+	void sync_prog();
+	// **液晶のメーターを埋める**（doc/native-engine.md の 6.148）
+	void draw_meter();
+	u8 m_meter_lv[16] = {};         // native が鳴らしている音の目盛り
+	u8 m_meter_smooth[16] = {};     // なまし（実機と同じ半分ずつ寄せる）
+	u8 m_meter_cell[16] = {};       // 前に液晶へ置いた棒の字（下 8 + 上 8）
+	u64 m_meter_next = 0;           // つぎになます時刻
+	// **パートの種類**（XG の 08 pp 07。0 が旋律、2-5 がドラム 1-4）。
+	// -1 はまだ SysEx を見ていない（ワーク RAM を読む）。バンク 127/126 で
+	// なくてもここでドラムになるので、音色の引き方を変える必要がある
+	// （doc/native-engine.md の 6.137）
+	s8 m_part_mode[64] = {};
+	static u64 drum_lead()
+	{
+		static const u64 v = std::getenv("SMU2000_DRUM_LEAD")
+		                   ? u64(std::atoi(std::getenv("SMU2000_DRUM_LEAD"))) : 3;
+		return v;
+	}
+	bool part_is_drum(int part) const
+	{
+		if (part < 0 || part >= 64)
+			return false;
+		if (m_part_mode[part] >= 0)
+			return m_part_mode[part] != 0;
+		const u32 off = xg::ram::part_base(part) + 0x07;
+		return m_ram.size() > off && m_ram[off] != 0;
+	}
 	void native_select_voice(int part);
 	// 受け取り終えた XG の SysEx を、native の側にも効かせる
 	void native_sysex(u64 fire);
@@ -532,6 +651,31 @@ private:
 	u64  m_fw_keymask = 0;     // firmware がつぎに鳴らすスロットのマスク
 	// firmware を細く回し続ける刻み（100ms ごとに 5ms）。止めきると液晶・
 	// ボタン・firmware 自身の後始末が全部止まる
+	// **パネルを触っている間は firmware を全速で回す**（doc/native-engine.md の 6.119）。
+	// native の口では firmware を 100ms につき 5ms しか回さないので、
+	// firmware の中の時間は 20 分の 1 でしか進まない。液晶もボタンも
+	// ダイヤルも firmware の仕事なので、そのままだと
+	//   * ダイヤルが毎秒 20 目盛りしか進まない（実機は 400）
+	//   * 画面が変わるまでひと呼吸かかる
+	// になる。触ってから この長さだけ全速で回すと、実機と同じ手触りになる。
+	// 触っていない間は今までどおり細く回すだけ（CPU は増えない）
+	// **0.5 秒では足りなかった**（6.146）。ダイヤルを 4 目盛り回すと、
+	// 実機モードは 4 つとも効くのに native は 1 つしか効かない。firmware は
+	// 目盛りを受け取ってから画面と音色を作り直すのに、firmware の中の時間で
+	// 1 秒近く掛かる。
+	// `SMU2000_PANEL_RUN` で振れる（サンプル数。0 で前の道に戻る）
+	static u32 panel_run()
+	{
+		static const u32 v = std::getenv("SMU2000_PANEL_RUN")
+		                   ? u32(std::atoi(std::getenv("SMU2000_PANEL_RUN")))
+		                   : u32(44100);          // 1 秒
+		return v;
+	}
+	void panel_touched() { m_panel_hold = panel_run(); }
+	// 液晶を書き換えている間の延長ぶん（短くてよい。止まればすぐ戻る）
+	static constexpr u32 LCD_RUN = 44100 / 10;     // 0.1 秒
+	u32 m_panel_hold = 0;
+
 	static constexpr u32 KEEPALIVE_EVERY = 4410;
 	static constexpr u32 KEEPALIVE_RUN = 220;
 public:
