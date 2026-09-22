@@ -263,6 +263,17 @@ public:
 	// サンプリング RAM（4MB）。確かめる用
 	const std::vector<u8> &sample_ram() const { return m_sampram; }
 
+	// ---- S-MU2000: パートの音（画面のスペクトラム用）
+	// 声（2 つのチップで 128）の出力を、混ぜる前に拾ってパートごとに足す。見たいパートを
+	// 決めたときだけ動く（-1 で止める）。声 → パートは、firmware が鳴らした声なら firmware の
+	// 声の表（ワーク RAM 0x424386 + 声 × 148 にパートの塊の番地。実測で 11387 回とも一致）、
+	// native が鳴らしている声なら native_driver が持つもの。音には触らない
+	static constexpr size_t SCOPE_N = 4096;       // 溜めておくサンプル数（2 の冪）
+	void set_scope_part(int part);
+	int scope_part() const { return m_scope_part.load(std::memory_order_relaxed); }
+	// 直近の n サンプル（n ≤ SCOPE_N、古い順）。読み手は画面の糸。途中の値が混ざってもよい
+	void scope_read(float *out, size_t n) const;
+
 	sh7043a_device &cpu()  { return *m_cpu; }
 	swp30_device   &swpm() { return m_swpm; }
 
@@ -418,6 +429,14 @@ private:
 	{
 		static const u32 v = std::getenv("SMU2000_OFF_PROC")
 		                   ? u32(std::atoi(std::getenv("SMU2000_OFF_PROC"))) : 2 * 64;
+		return v;
+	}
+	// 重い SysEx（エフェクトの種類など）のあと、firmware を全速で回す長さ
+	static u32 fx_hold()
+	{
+		static const u32 v = std::getenv("SMU2000_FX_HOLD")
+			? u32(44100 * std::atoi(std::getenv("SMU2000_FX_HOLD")) / 1000)
+			: u32(44100 * 3 / 10);
 		return v;
 	}
 	static u32 native_proc64()
@@ -588,6 +607,18 @@ private:
 	u8 m_meter_smooth[16] = {};     // なまし（実機と同じ半分ずつ寄せる）
 	u8 m_meter_cell[16] = {};       // 前に液晶へ置いた棒の字（下 8 + 上 8）
 	u64 m_meter_next = 0;           // つぎになます時刻
+	// **演奏画面の音色まわりを native が描く**（6.190）。
+	// 名前（行 0 の 9-16）・プログラムの 3 桁（行 1 の 14-16）・
+	// 楽器の絵（外字 0-2・4-6）だけ。firmware は 100ms につき 5ms しか
+	// 回らないので、任せると音色を替えてから最大 100ms 遅れる
+	void draw_voice_fields();
+	void release_voice_fields();
+	bool m_vf_owned = false;        // いま持っているか
+	u8  m_vf_name[8] = {};          // 前に置いた名前
+	u8  m_vf_prog[3] = {};          // 前に置いた番号
+	u8  m_vf_bank[3] = {};          // 前に置いたバンク（6.202）
+	u16 m_vf_icon[16] = {};         // 前に置いた絵
+	int m_vf_part = -1;
 	// **パートの種類**（XG の 08 pp 07。0 が旋律、2-5 がドラム 1-4）。
 	// -1 はまだ SysEx を見ていない（ワーク RAM を読む）。バンク 127/126 で
 	// なくてもここでドラムになるので、音色の引き方を変える必要がある
@@ -609,6 +640,8 @@ private:
 		return m_ram.size() > off && m_ram[off] != 0;
 	}
 	void native_select_voice(int part);
+	// そのバンク LSB を実機が受け付けるか（6.202）
+	bool voice_lsb_ok(int msb, int lsb) const;
 	// 受け取り終えた XG の SysEx を、native の側にも効かせる
 	void native_sysex(u64 fire);
 
@@ -619,6 +652,12 @@ private:
 	int  m_learn_note = 60, m_learn_vel = 100, m_learn_part = 0;
 	// firmware が鳴らしている音の数（パートごと）。0 でなければベンドも firmware へ回す
 	u8   m_fw_notes[64] = {};
+	// firmware が鳴らしている音の、液晶のメーター用の目盛り（6.188）。
+	// 打った時刻も覚えておく（m_fw_notes はオールノートオフなどで
+	// 戻らないことがあり、そのままだと棒が立ちっぱなしになる）
+	u8   m_fw_meter[16] = {};
+	u64  m_fw_meter_at[16] = {};
+	static constexpr u64 FW_METER_HOLD = 44100 * 4;
 	u32  m_fw_note_total = 0;
 	// firmware の音のために回すのは、いちばん新しい音から この長さだけ。
 	// フィルタ・LFO の包絡線はそのころには落ち着いている。
@@ -693,6 +732,18 @@ private:
 	void native_learn_finish();
 
 	swp30_device m_swpm, m_swps;   // マスタ 0x800000 / スレーブ 0x802000
+
+	// パートの音（set_scope_part）。チップごとに輪を持ち、読むときに足す
+	// （スレーブは別の糸で回ることがあるので、書き手を分ける）
+	struct scope_tap { mu2000 *self; int chip; };
+	scope_tap m_scope_ctx[2] = { { this, 0 }, { this, 1 } };
+	std::atomic<int> m_scope_part{-1};
+	std::array<std::atomic<s8>, 128> m_scope_owner{};     // 声 → パート（-1 は無し）
+	std::array<std::array<float, SCOPE_N>, 2> m_scope_ring{};
+	std::array<std::atomic<u32>, 2> m_scope_w{};          // チップごとの書いた数
+	u32 m_scope_tick = 0;
+	static void scope_tap_fn(void *ctx, const s32 *samples);
+	void scope_refresh_owner();
 	required_device<sci4_device> m_sci4_finder;
 	sci4_device *m_sci4 = nullptr;   // PLG ボード用 0xf00000
 	mem_bus      m_bus;

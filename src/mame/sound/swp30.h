@@ -28,6 +28,16 @@ public:
 
 	swp30_device();
 
+	// S-MU2000: 包絡線（音量・音程）の 1 サンプルの歩幅。sample_counter はチップの
+	// サンプルの数え値。画面が包絡線の時間を描くのに使う（src/ui の絵）
+	static u16 envelope_step(s32 speed, u32 sample_counter);
+	// S-MU2000: 声のフィルタ（レジスタ 0x00-0x04 をそのまま）に 1 サンプルのインパルスを通した応答。
+	// 画面がフィルタの特性を描くのに使う。out[i] は入力 1 に対する出力
+	static void filter_impulse(u16 f1a, u16 level1, u16 f2a, u16 level2, u16 fb, float *out, int n);
+	// S-MU2000: 声の LFO（レジスタ 0x0a をそのまま）を 0 から n サンプル回したときの音程のずれ
+	// （音程のレジスタの目盛り。1 オクターブ 1024）。画面がビブラートを描くのに使う
+	static void lfo_pitch_trace(u16 type_step_pitch, s16 *out, int n);
+
 	// S-MU2000: エフェクトを C++ で鳴らす軽量モード（doc/native-dsp.md）。nullptr で切。
 	// full なら MEG そのものを回さず、乾いた音も C++ 側で混ぜる（そのぶん軽い）
 	void set_native_fx(smu2000::dsp::native_fx *fx, bool full = false, int mask = 15)
@@ -100,6 +110,12 @@ public:
 	std::FILE *m_dbg_meg = nullptr;
 	u32 m_dbg_meg_from = 0, m_dbg_meg_count = 0;
 	u16 m_dbg_meg_pc0 = 0, m_dbg_meg_pc1 = 0x180;
+
+	// S-MU2000: 声ごとの出力（包絡線を掛けたあと、混ぜる前）を 1 サンプルごとに渡す口。
+	// 画面がパートの音のスペクトラムを描くのに使う（mu2000 の scope_*）。音には触らない
+	using voice_tap_fn = void (*)(void *ctx, const s32 *samples_per_chan);
+	voice_tap_fn m_voice_tap = nullptr;
+	void *m_voice_tap_ctx = nullptr;
 
 	// MEG の入口・出口の書き出し（移植の突き合わせ用）
 	std::FILE *m_dbg_dac = nullptr;
@@ -270,7 +286,8 @@ private:
 
 		// S-MU2000: speed は符号付き。ピッチ EG は 16 段遅らせて引くので、
 		// もとの表より下（負）まで伸びる。8 段下がるごとに半分の速さ
-		u16 level_step(s32 speed, u32 sample_counter);
+		// 声の状態を使わないので static（画面が包絡線の時間を描くのにも使う）
+		static u16 level_step(s32 speed, u32 sample_counter);
 	};
 
 	struct lfo_block {
@@ -292,6 +309,8 @@ private:
 		u16 get_amplitude() const;
 		s16 get_pitch() const;
 		void step(swp30_device &swp);
+		// S-MU2000: 乱数を使わない分だけ進める（step の中身。戻り値は進める前のカウンタ）
+		u32 advance();
 
 		void type_step_pitch_w(u16 data);
 		void amplitude_w(u16 data);
@@ -450,6 +469,18 @@ public:
 	// 実機の firmware も、鳴り終わった声は切らない
 	bool slot_active(int chan) const
 	{ return chan >= 0 && chan < 0x40 && m_envelope[chan].active(); }
+	// **firmware がその声のスロットを空けるところ**（6.207）。firmware は
+	// 内部レジスタ 0 で包絡線を読み（0x12E856）、「立ち上がりではなく、
+	// 減衰が半分（0x2000）まで来た」声のスロットを空ける（0x1278C4）。
+	// 空いたあとはそのスロットに一切書かないので、native もここで止める
+	bool slot_freed(int chan) const
+	{
+		if (chan < 0 || chan >= 0x40)
+			return true;
+		const envelope_block &e = m_envelope[chan];
+		return e.m_envelope_mode != envelope_block::ATTACK &&
+			e.m_envelope_level >= 0x2000;
+	}
 private:
 	void peg_step(int chan);
 	std::array<filter_block,    0x40> m_filter = {};

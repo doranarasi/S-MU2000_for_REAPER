@@ -1,78 +1,62 @@
-# S-MU2000
+# S-MU2000 for REAPER
 
-Yamaha MU2000 のソフトウェア音源。DAW に挿して使えることを目指す。
+VST3プログラムチェンジ対応のリポジトリを再利用。
+REAPER向けの変更がメイン内容です。
 
-**現在の状態: VST3・CLAP（Windows）と VST3・Audio Unit（macOS）として DAW に挿して鳴る。実機のフロントパネル風の画面と、PC で触るエディタが付いた。**
+変更対象はVST3とCLAPのplugin.cppのみです。
 
-作りかけを晒しながら進めている。X では `#S_MU2000`。
+## VST3
 
-> ヤマハとは無関係の非公式なプロジェクト。Yamaha・MU2000・XG はヤマハ株式会社の商標。
+CUBASE等では既にバンクセレクトMSB, LSBを伴うPCが正常に機能しますが、REAPERでは同tickにそれらメッセージを置くと正常に処理されません。
+PCがMSB, LSBよりも早く処理されてしまうためです。
 
-## 実機由来のデータは、配らない・載せない
+MIDIイベントリストでMSB->LSB->PCの順で書いたとしても、MIDI入力データの内部オフセットの影響で必ずPC(0)->MSB->LSBの順で処理されます。
+REAPERインストール後の初期状態でこうなので、恐らくそういうものです。
 
-**このリポジトリが公開しているのは、エミュレータと吸い出し道具のソースコードだけ。**
-ヤマハの ROM・波形データ・ファームウェアは、このリポジトリにも配布物にも入っていないし、
-今後も入れない。動かすのに要る ROM は、利用者が**自分の持っている MU2000 から各自で取り出す**。
+この挙動は詳細設定のMIDI入力から、利用しているMIDI-InのMIDIタイムスタンプをQPCに変更すると緩和します。
+ただし当環境で体感半数は順番が変わってしまう。
+なおMIDIファイルインポート時においての改善方法は見つかっていません。
 
-ソースコードを公開することと、実機から取り出したデータを公開・共有することは**別の話**で、
-このプロジェクトは後者をしない。使う人にも次をお願いする。
+CUBASEはどうなのかと軽く調べてみたところ、そもそもCCもPCもoffset 0となっていました。
+すべて0の場合は入力順に処理されるだけなので、こういった問題が起きないということのようです。
 
-* 吸い出した波形 ROM・プログラム ROM のイメージを、GitHub その他どこにも再配布しない
-* 実機由来の ROM イメージを、Issue・Pull Request・Discussion・Release・添付ファイルなどに
-  載せない。不具合の報告は、ハッシュ値・ログ・MIDI ファイル・録音で足りる
-* 吸い出しの途中で作ったカスタムファームウェア、改変したファームウェアイメージ、
-  カスタムの `.ydl`（ダンパなど）も配らない。どれも純正ファームウェアを含んでいる
-* ヤマハの更新プログラム（`mu2r1_uw.zip`）は、ヤマハの配布ページから各自で入手する
+### 変更点
 
-これらの実機由来のデータは、S-MU2000 のソースコードとは扱いが別で、
-下の「由来とライセンス」の対象でもない。
+一旦CC, PCのオフセット取得処理でダミー変数に代入するようにし、元の変数は0のまま処理するようにしました。
+全CC, PCのオフセット値が0固定になるため、REAPERでもイベントリスト順で処理できるようになります。
 
-> **Notice (English).** This repository contains source code only. It does not include
-> or distribute any Yamaha ROM, wave data or firmware, and never will. To run it, you
-> extract the ROMs from your own MU2000. Publishing this source code and sharing data taken
-> from the hardware are separate matters; this project does only the former.
-> Please do not upload ROM images, wave dumps, custom or modified firmware images, or
-> custom `.ydl` files anywhere, including Issues, Pull Requests, Discussions, Releases and
-> attachments. Hashes, logs, MIDI files and recordings are enough for bug reports.
+今のところこの変更が引き金となる不具合は確認していませんが、利用は自己責任でお願いします。
 
-実機の firmware をそのまま走らせ、MIDI を受けて発音する。音は実機を S/PDIF で
-録ったものと直接比べて詰めている（いずれも 1/3 オクターブの帯ごとの差）。
+## CLAP
 
-* XG の GM 128 音色と、そのほかの XG 音色 1225 種（C2・C4・C6）。C4 では 1225 種のうち
-  1109 種が差 1.5dB 未満。残る 116 種のうち 60 種は、実機で録り直しただけでも同じくらい揺れる
-* パフォーマンスモードの 100 パフォーマンス。帯の差の平均 0.61dB（実機どうしの再現性は 0.22dB）
-* システムのリバーブ・コーラスの全種類、バリエーションを送りで使う形、コントローラ、
-  ドラムの楽器ごとの NRPN、マルチ EQ、128 声を超えたときの奪い合い
+REAPERでもCLAP版ならばPC,CC周りの問題は発生しませんが、その代わり実装されている4ポートの同一ChにMIDIメッセージが送信されます。
 
-合わないものと、調べた経過は [doc/todo.md](doc/todo.md) に残してある。
+VST3版はレシーブトラックを用いてMIDI BUS周りの設定を適切に行えば、プラグインピンコネクタの右クリックメニューから
+`MIDI入力->REAPER MIDIバスをVST MIDIバスにマッピング`を選択することによって、4ポート計64Chを利用できます。
+CLAPのピンコネクタにはそもそもMIDI関連の設定がありません。
+そもそもCLAPで16ch以上使うことを想定していない気がします。
 
-音源の JIT（SH2 と MEG の命令を機械語に訳す）が入り、16 パートが鳴りっぱなしの
-試験曲でも CPU の使用率は実時間のおよそ 22%（Ryzen 7 9700X、1 ブロックの平均）。
-LCD は firmware が書いたものがそのまま出て、ボタンもダイヤルも触れる。
+とにかく現状REAPERでCLAPプラグインを使う場合は、2ポート以上に増やしてはいけないようです。
 
-## これは何か
+ElementでCLAPを読み込み確認したところ、MIDI入力4ポートのプラグインとして正常に扱えたので、
+CLAPの規格自体で扱えない処理が実装されている訳ではなさそう。
+有識者の情報求む。
 
-MU2000 の中身（SH7043 CPU + SWP30 音源チップ ×2）をソフトウェアで動かし、
-実機の firmware をそのまま走らせる。エミュレータなので、音色も挙動も実機由来になる。
+### 変更点
 
-MAME でも MU2000 は鳴る。だが MAME は自分で時計を持って実時間に追いつこうとする
-つくりで、DAW や外部シーケンサと同期させると遅れが溜まって破綻する（実測で
-処理能力に 177% の余力がありながら平均速度が 98% 台から上がらない）。
-ソフトシンセはホストのオーディオコールバックに駆動されるので、この問題が原理的に起きない。
+流石にどうにもならないので1ポートに制限。
 
-くわしくは [doc/design.md](doc/design.md)。残っているものは
-[doc/todo.md](doc/todo.md) に、直す順で並べてある。
+プラグインのMIDI入力としてのポート数を制限しただけなので、SysExを用いてBポート以降をレイヤー用Chとして用いることは可能です。
 
-## ROM について
+特にVST3や多ポート入力にこだわらないのであれば、こちらの利用をお勧めします。
 
-**ROM は同梱しない。** 利用者が自分の MU2000 から吸い出す必要がある。
-吸い出したものの扱いは、上の「[実機由来のデータは、配らない・載せない](#実機由来のデータは配らない載せない)」のとおり。
+---
 
-| ROM | 内容 |
-|---|---|
-| プログラム ROM | 4MB（本体の firmware） |
-| 波形 ROM | 32MB（音色データ） |
 
+<<<<<<< HEAD
+突貫工事なので現状makeで一緒にexe版も作られるうえ、AU版のコードも含んだままです。
+そちらのほうに独自に変更を与える予定はありません。
+=======
 **吸い出しの手順と道具は [doc/dump/](doc/dump/) に入っている。**
 
 rom ディレクトリには次を置く。
@@ -286,9 +270,43 @@ Windows の「既定の再生デバイス」は勝手に変わる（実際、設
 ## ビルドについて
 
 Windows は MSYS2 / MinGW-w64 の g++、macOS は Apple の clang++、Linux は g++ を想定している。C++20 が要る。
-Linux は画面の要らない道具（render・panel・各種試験）だけが動く（[doc/linux.md](doc/linux.md)）。
 `make test` で回帰試験が回る（[doc/testing.md](doc/testing.md)）。ROM が無い
 機械でも、ROM の要らない分だけは走る。
+
+### Linux で作る
+
+> **Linux の画面とプラグインについて（PR [#33](https://github.com/tarboh/S-MU2000/pull/33)）**
+> Linux の `gui`・VST3・CLAP は spessasus さんの寄稿で、作者は Linux を使っておらず、
+> 動作を確かめることも、面倒を見ることも、**責任を取ることもできない**。使うのは自己責任で。
+> 不具合の報告や直しは、Linux を使っている人からの issue・PR を歓迎する。
+>
+> **Linux GUI and plug-ins (PR #33).** These were contributed by spessasus. The maintainer does not use
+> Linux and **cannot test, support, or take responsibility for them**. Use them at your own risk.
+> Reports and fixes from Linux users are welcome.
+
+Debian/Ubuntu では次を、Arch ではその下のを入れる。
+
+```
+sudo apt install build-essential libasound2-dev libcairo2-dev libfontconfig-dev libsdl3-dev
+sudo pacman -Sy base-devel alsa-lib cairo fontconfig sdl3
+```
+
+`make` で `build-linux/` に道具一式と `gui`、VST3・CLAP ができる。ROM は
+`roms/` に置く（中身は「[ROM について](#rom-について)」と同じ）。
+
+```
+build-linux/gui roms                       実機パネル風の画面で鳴らす（表示は英語。F2・F3 で PC の窓）
+build-linux/gui roms --boot --shot out.png 画面の絵だけ書き出す
+make vst3 / make clap                      DAW に挿す形（画面は汎用のもの）
+make probe                                 DAW 無しで読み込みと発音を確かめる
+make test                                  回帰試験（ROM と numpy が要る。Debian は python3-numpy、Arch は python-numpy）
+```
+
+VST3・CLAP の ROM は `S_MU2000_ROMS` 環境変数か、バンドルの横の `roms.txt`
+（`~/.vst3`・`~/.clap` へ入れたものは `~/.local/share/S-MU2000/roms.txt`）
+で場所を教える。待ち時間・MIDI の選び方など使い方は Windows 版と同じ。
+くわしくは [doc/linux.md](doc/linux.md)（道具と `live`）と
+[doc/porting-linux-gui.md](doc/porting-linux-gui.md)（画面）。
 Windows の exe は **MSYS2 の DLL に依存しない**ように静的リンクしてある
 （動的リンクのままだと、素の PowerShell から起動しても何も言わずに終わる）。
 
@@ -352,3 +370,4 @@ MAME へ送っている。見つけたもの全部と、送ったかどうかは
 [#16150](https://github.com/mamedev/mame/pull/16150)（DPCM の端数）・
 [#16151](https://github.com/mamedev/mame/pull/16151)（歪み系エフェクトで見つけた MEG の演算器の端の場合）・
 [#16154](https://github.com/mamedev/mame/pull/16154)（切ったリバーブ RAM の区画の読み書き）。
+>>>>>>> upstream/main

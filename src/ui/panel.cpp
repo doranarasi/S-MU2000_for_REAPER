@@ -14,6 +14,7 @@
 
 #include "panel.h"
 #include "draw.h"
+#include "texts.h"
 
 #include <algorithm>
 #include <cmath>
@@ -187,18 +188,22 @@ void panel::resize(int w, int h)
 {
 	m_w = std::max(w, 200);
 	m_h = std::max(h, 60);
+	// **帯のぶんを差し引いてから合わせる**。当たりも描きも
+	// `scale()` / `at()` を通るので、ここだけ直せば全部ついてくる
+	const int body_h = std::max(m_h - m_top_inset, 60);
 
 	if (m_lcd_only) {
 		const double margin = 5.0;
 		const double view_w = m_lay.lcd[2] + margin * 2;
 		const double view_h = m_lay.lcd[3] + margin * 2;
-		m_scale = std::min(double(m_w) / view_w, double(m_h) / view_h);
+		m_scale = std::min(double(m_w) / view_w, double(body_h) / view_h);
 		m_ox = int((m_w - view_w * m_scale) / 2 - (m_lay.lcd[0] - margin) * m_scale);
-		m_oy = int((m_h - view_h * m_scale) / 2 - (m_lay.lcd[1] - margin) * m_scale);
+		m_oy = m_top_inset
+		     + int((body_h - view_h * m_scale) / 2 - (m_lay.lcd[1] - margin) * m_scale);
 	} else {
-		m_scale = std::min(double(m_w) / LOGICAL_W, double(m_h) / LOGICAL_H);
+		m_scale = std::min(double(m_w) / LOGICAL_W, double(body_h) / LOGICAL_H);
 		m_ox = int((m_w - LOGICAL_W * m_scale) / 2);
-		m_oy = int((m_h - LOGICAL_H * m_scale) / 2);
+		m_oy = m_top_inset + int((body_h - LOGICAL_H * m_scale) / 2);
 	}
 
 	m_lcd    = scale(m_lay.lcd[0], m_lay.lcd[1], m_lay.lcd[2], m_lay.lcd[3]);
@@ -239,11 +244,11 @@ void panel::build_spots()
 
 	// 面を選ぶつまみ。本体の外（下の帯）
 	m_spots.push_back({ spot_kind::tab, mu2000::button::count, CTL_TAB_FRONT,
-	                    scale(700, 386, 94, 13), "パネル", "" });
+	                    scale(700, 386, 94, 13), texts().tab_panel, "" });
 	m_spots.push_back({ spot_kind::tab, mu2000::button::count, CTL_TAB_EDIT,
-	                    scale(800, 386, 94, 13), "エディタ", "" });
+	                    scale(800, 386, 94, 13), texts().tab_editor, "" });
 	m_spots.push_back({ spot_kind::tab, mu2000::button::count, CTL_TAB_FX,
-	                    scale(898, 386, 94, 13), "エフェクト", "" });
+	                    scale(898, 386, 94, 13), texts().tab_effects, "" });
 
 	if (m_page == page::editor) { build_editor_spots(); return; }
 	if (m_page == page::effects) { build_effect_spots(); return; }
@@ -880,9 +885,7 @@ void panel::paint_front(HDC dc, const snapshot &s, u64 pressed, double volume,
 	if (status && status[0])
 		text_in(dc, m_status, status, PANEL_INK, m_font_small,
 		        DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-	text_in(dc, m_hint,
-	        "大きなダイヤルはホイールで回す ／ ボタンはクリック ／ "
-	        "キー: A=PLAY E=EDIT U=UTIL F=EFFECT [ ]=PART",
+	text_in(dc, m_hint, texts().hint_front,
 	        RGB(120, 124, 130), m_font_small, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
 	draw_tabs(dc);

@@ -28,11 +28,13 @@ namespace vst3 {
 
 class plug_view;
 
-// The panel buttons a keyboard can reach.
+// The panel buttons a keyboard can reach, as mu2000::button values.
 //
 // Each platform maps its own key codes onto these, and view.cpp maps these onto
 // mu2000::button. Doing it in two steps keeps the meaning of a key in one place
-// instead of once per window system.
+// instead of once per window system. The letter keys additionally share their
+// meaning with the GUI front ends through ui/keymap.h: each platform window
+// turns its key codes into characters first, then into these.
 enum plug_key {
 	PLUG_KEY_NONE = 0,
 	PLUG_KEY_PLAY,
@@ -52,7 +54,24 @@ enum plug_key {
 	PLUG_KEY_AUDITION,
 	PLUG_KEY_SELECT,
 	PLUG_KEY_SAMPLING_MODE,
+	// Not panel buttons: these open the PC windows, the way F3 and F2 do
+	// in gui.exe. The view turns them into plug_window::open_* instead of
+	// a mu2000::button
+	PLUG_KEY_LIST,
+	PLUG_KEY_EDITOR,
+	// Toggles the native engine, the way F4 does in gui.exe
+	PLUG_KEY_ENGINE,
 };
+
+// Which PC window. The button bar and the keys both name them this way
+enum pc_kind {
+	PC_LIST = 0,      // 一覧
+	PC_EDITOR,        // エディタ
+	PC_FX,            // インサーションの設定
+	PC_SHAPES,        // パートの音色
+	PC_MASTER,        // マスター
+};
+
 
 // A real window on the host's platform, holding the panel
 class plug_window
@@ -85,6 +104,11 @@ public:
 	// right-click menu. Called from the GUI thread at the panel's repaint
 	// rate; does nothing while no window is visible
 	virtual void pc_frame(::xg::model &, const ::ui::xg_snapshot &, ::ui::bridge &) {}
+
+	// Open one of those windows, from a key (F3 / F2) or from the button
+	// bar at the top of the panel. Platforms without PC windows leave this
+	// alone
+	virtual void open_pc_window(int kind) {}
 };
 
 // The platform type string this build answers to: kPlatformTypeHWND on

@@ -160,6 +160,53 @@ public:
 		m_xg_seq.fetch_add(1, std::memory_order_release);
 	}
 
+	// ---- XG の既定値（.syx の書き出しで「既定と違うものだけ」を出すときの比べる相手）
+	//
+	// 画面が頼み、音声の糸が 1 度だけ作って置く（ui/driver.h の serve_defaults）。
+	// 起動した直後の値ではなく、XG System On を受けた直後の値。置いてあれば true
+	void request_defaults() { m_want_defaults.store(true, std::memory_order_relaxed); }
+	bool take_defaults_request() { return m_want_defaults.exchange(false, std::memory_order_relaxed); }
+	void publish_defaults(const xg_snapshot &s)
+	{
+		std::memcpy(&m_defaults, &s, sizeof(m_defaults));
+		m_have_defaults.store(true, std::memory_order_release);
+	}
+	bool have_defaults() const { return m_have_defaults.load(std::memory_order_acquire); }
+	bool read_defaults(xg_snapshot &out) const
+	{
+		if (!m_have_defaults.load(std::memory_order_acquire))
+			return false;
+		std::memcpy(&out, &m_defaults, sizeof(out));   // 1 度置いたら書き換えない
+		return true;
+	}
+
+	// ---- パートの音（音色の窓のスペクトラム）。画面が見たいパートを置き（-1 で止める）、
+	// 音声の糸が 25ms ごとに直近の SCOPE_N サンプルを置く（mu2000::scope_read）。読み手は待たない
+	static constexpr size_t SCOPE_N = 2048;
+	void want_scope(int part) { m_scope_want.store(part, std::memory_order_relaxed); }
+	int scope_wanted() const { return m_scope_want.load(std::memory_order_relaxed); }
+	void publish_scope(const float *s, int part)
+	{
+		m_scope_seq.fetch_add(1, std::memory_order_release);
+		std::memcpy(m_scope, s, sizeof(m_scope));
+		m_scope_part = part;
+		m_scope_seq.fetch_add(1, std::memory_order_release);
+	}
+	// 置いてあれば、そのパートの番号を返す（無ければ -1）
+	int read_scope(float *out) const
+	{
+		for (int tries = 0; tries < 8; tries++) {
+			const unsigned a = m_scope_seq.load(std::memory_order_acquire);
+			if (a & 1)
+				continue;
+			std::memcpy(out, m_scope, sizeof(m_scope));
+			const int part = m_scope_part;
+			if (m_scope_seq.load(std::memory_order_acquire) == a)
+				return a ? part : -1;
+		}
+		return -1;
+	}
+
 	void publish(const snapshot &s)
 	{
 		m_seq.fetch_add(1, std::memory_order_release);
@@ -225,7 +272,14 @@ private:
 	std::atomic<unsigned> m_seq{0};
 	snapshot              m_snap;
 	std::atomic<unsigned> m_xg_seq{0};
+	std::atomic<int>      m_scope_want{-1};
+	std::atomic<unsigned> m_scope_seq{0};
+	float                 m_scope[SCOPE_N] = {};
+	int                   m_scope_part = -1;
 	xg_snapshot           m_xg;
+	std::atomic<bool>     m_want_defaults{false};
+	std::atomic<bool>     m_have_defaults{false};
+	xg_snapshot           m_defaults;
 };
 
 } // namespace ui

@@ -6,9 +6,12 @@
 #include "backends/imgui_impl_dx11.h"
 #include "backends/imgui_impl_win32.h"
 
+#include <commdlg.h>
+#include <cstdio>
 #include <d3d11.h>
 #include <iterator>
 #include <shellapi.h>
+#include <vector>
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -28,6 +31,49 @@ const char *const FONTS[] = {
 bool file_exists(const char *path)
 {
 	return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+}
+
+// .syx の書き出し・読み込みの窓（xgui::ask_save_file・ask_open_file の頼み）。
+// 描き終えたあとに開く。窓が回っている間にタイマーが別のコマを描いても、前のコマは終わっている
+void file_dialog(HWND owner, xgui::file_ask ask, const std::vector<u8> &bytes)
+{
+	wchar_t path[MAX_PATH * 4] = {};
+	if (ask == xgui::file_ask::save)
+		wcscpy_s(path, L"S-MU2000.syx");
+	OPENFILENAMEW o{};
+	o.lStructSize = sizeof(o);
+	o.hwndOwner   = owner;
+	o.lpstrFilter = L"SysEx (*.syx)\0*.syx\0すべてのファイル\0*.*\0";
+	o.lpstrFile   = path;
+	o.nMaxFile    = DWORD(std::size(path));
+	o.lpstrDefExt = L"syx";
+	if (ask == xgui::file_ask::save) {
+		o.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+		if (!GetSaveFileNameW(&o))
+			return;
+		std::FILE *f = _wfopen(path, L"wb");
+		const bool ok = f && std::fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size();
+		if (f)
+			std::fclose(f);
+		char note[64];
+		std::snprintf(note, sizeof(note), ok ? "書き出した（%zu バイト）" : "書き出せなかった", bytes.size());
+		xgui::set_file_note(note);
+		return;
+	}
+	o.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+	if (!GetOpenFileNameW(&o))
+		return;
+	std::vector<u8> in;
+	if (std::FILE *f = _wfopen(path, L"rb")) {
+		u8 buf[65536];
+		size_t n;
+		while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0 && in.size() < (16u << 20))
+			in.insert(in.end(), buf, buf + n);
+		std::fclose(f);
+		xgui::give_opened_file(std::move(in));
+	} else {
+		xgui::set_file_note("読めなかった");
+	}
 }
 
 } // namespace
@@ -62,6 +108,7 @@ bool pc_window::show(HINSTANCE inst, std::string &err)
 
 bool pc_window::create(HINSTANCE inst, std::string &err)
 {
+	xgui::set_file_dialogs(true);
 	WNDCLASSEXW wc{};
 	wc.cbSize        = sizeof(wc);
 	wc.style         = CS_CLASSDC;
@@ -199,6 +246,7 @@ void pc_window::frame(xg::model &m, const xg_snapshot &ram, bridge &br)
 	ImGui_ImplWin32_NewFrame();
 	ImGui::NewFrame();
 	m_view->draw(m, ram, br);
+	xgui::drag_flush(br);          // マウスで動かしている値の、間引いた送信
 	ImGui::Render();
 
 	const float clear[4] = { 0.10f, 0.10f, 0.11f, 1.0f };
@@ -207,6 +255,11 @@ void pc_window::frame(xg::model &m, const xg_snapshot &ram, bridge &br)
 	ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 	// 待たない。gui のタイマー（30 コマ／秒）が間隔を決める
 	m_swap->Present(0, 0);
+
+	std::vector<u8> bytes;
+	const xgui::file_ask ask = xgui::take_file_ask(bytes);
+	if (ask != xgui::file_ask::none)
+		file_dialog(m_hwnd, ask, bytes);
 }
 
 LRESULT CALLBACK pc_window::proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
@@ -214,6 +267,11 @@ LRESULT CALLBACK pc_window::proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 	auto *self = reinterpret_cast<pc_window *>(GetWindowLongPtrW(h, GWLP_USERDATA));
 	if (self && self->m_imgui) {
 		ImGui::SetCurrentContext(self->m_imgui);
+		// 文字を打つ箱の外では、文字（WM_CHAR）を ImGui に渡さない。鍵盤で弾こうとキーを押しっぱなしに
+		// するとリピートで文字が毎秒何十も来て、ImGui がマウスの動きと交互に 1 コマずつしか進めない
+		// （trickle）。マウスの軌跡が溜まって、絵の点も送る値も遅れてついてくる
+		if (msg == WM_CHAR && !ImGui::GetIO().WantTextInput)
+			return 0;
 		if (ImGui_ImplWin32_WndProcHandler(h, msg, wp, lp))
 			return 1;
 	}
