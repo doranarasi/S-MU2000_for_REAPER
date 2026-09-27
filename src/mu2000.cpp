@@ -21,6 +21,7 @@
 #include <cstring>
 
 #include "compat/platform.h"
+#include "compat/realtime.h"
 
 
 namespace {
@@ -111,21 +112,68 @@ void mu2000::set_scope_part(int part)
 		scope_refresh_owner();
 }
 
+void mu2000::set_part_scopes(bool on)
+{
+	if (m_pscope_on.exchange(on, std::memory_order_relaxed) != on && on)
+		scope_refresh_owner();
+}
+
 void mu2000::scope_tap_fn(void *ctx, const s32 *samples)
 {
 	const scope_tap &t = *static_cast<const scope_tap *>(ctx);
 	mu2000 &m = *t.self;
 	const int part = m.m_scope_part.load(std::memory_order_relaxed);
-	if (part < 0)
-		return;
-	float sum = 0.0f;
 	const int base = t.chip * 64;
-	for (int i = 0; i < 64; i++)
-		if (samples[i] && m.m_scope_owner[size_t(base + i)].load(std::memory_order_relaxed) == part)
-			sum += float(samples[i]);
-	const u32 w = m.m_scope_w[size_t(t.chip)].load(std::memory_order_relaxed);
-	m.m_scope_ring[size_t(t.chip)][w & (SCOPE_N - 1)] = sum;
-	m.m_scope_w[size_t(t.chip)].store(w + 1, std::memory_order_release);
+	if (part >= 0) {
+		float sum = 0.0f;
+		for (int i = 0; i < 64; i++)
+			if (samples[i] && m.m_scope_owner[size_t(base + i)].load(std::memory_order_relaxed) == part)
+				sum += float(samples[i]);
+		const u32 w = m.m_scope_w[size_t(t.chip)].load(std::memory_order_relaxed);
+		m.m_scope_ring[size_t(t.chip)][w & (SCOPE_N - 1)] = sum;
+		m.m_scope_w[size_t(t.chip)].store(w + 1, std::memory_order_release);
+	}
+	// 全パート（一覧）。1 サンプルに 64 パートぶんの行を 1 つ
+	if (m.m_pscope_on.load(std::memory_order_relaxed)) {
+		const u32 w = m.m_pscope_w[size_t(t.chip)].load(std::memory_order_relaxed);
+		float *row = m.m_pscope.data() + (size_t(t.chip) * PSCOPE_N + (w & (PSCOPE_N - 1))) * 64;
+		std::fill(row, row + 64, 0.0f);
+		for (int i = 0; i < 64; i++) {
+			if (!samples[i])
+				continue;
+			const int o = m.m_scope_owner[size_t(base + i)].load(std::memory_order_relaxed);
+			if (o >= 0 && o < 64)
+				row[o] += float(samples[i]);
+		}
+		m.m_pscope_w[size_t(t.chip)].store(w + 1, std::memory_order_release);
+	}
+}
+
+void mu2000::part_scope_read(int part, float *out, size_t n) const
+{
+	n = std::min(n, PSCOPE_N);
+	if (part == PSCOPE_OUT) {
+		const u32 end = m_oscope_w.load(std::memory_order_acquire);
+		for (size_t i = 0; i < n; i++) {
+			const u32 k = end - u32(n) + u32(i);
+			out[i] = (end >= n || k < end) ? m_oscope[k & (PSCOPE_N - 1)] : 0.0f;
+		}
+		return;
+	}
+	if (part < 0 || part >= 64) {
+		std::fill(out, out + n, 0.0f);
+		return;
+	}
+	const u32 end = std::min(m_pscope_w[0].load(std::memory_order_acquire), m_pscope_w[1].load(std::memory_order_acquire));
+	for (size_t i = 0; i < n; i++) {
+		const u32 k = end - u32(n) + u32(i);
+		if (end < n && k >= end) {
+			out[i] = 0.0f;
+			continue;
+		}
+		const size_t at = size_t(k & (PSCOPE_N - 1));
+		out[i] = m_pscope[at * 64 + size_t(part)] + m_pscope[(PSCOPE_N + at) * 64 + size_t(part)];
+	}
 }
 
 namespace {
@@ -197,7 +245,7 @@ void mu2000::scope_refresh_owner()
 	constexpr u32 VOICE_STRIDE = 148;
 	for (int v = 0; v < 128; v++) {
 		int owner = -1;
-		if (m_native_engine && v < 64)
+		if (m_native_engine)
 			owner = m_ndrv.slot_part(v);
 		if (owner < 0) {
 			const u32 off = VOICE_TABLE + u32(v) * VOICE_STRIDE;
@@ -292,7 +340,13 @@ void mu2000::apply_threading()
 
 void mu2000::slave_loop(u64 seen)
 {
+	// The platform's real-time audio workgroup, if it has one
+	// (src/compat/realtime.h). Joins whatever the front end asked for and
+	// leaves it on the way out; null keeps today's behavior.
+	smu2000::realtime_join wg;
 	for (;;) {
+		if (wg.active())
+			wg.reset(m_rt_wg_want.load(std::memory_order_acquire));
 		// 合図を待つ。1 サンプルの中の待ちは 1 マイクロ秒に満たないので、
 		// まず回して待つ。眠っていては 44100 回/秒には間に合わない。
 		//
@@ -492,7 +546,23 @@ u16 mu2000::leds() const
 	u16 out = 0;
 	for (int i = 0; i < 10; i++)
 		out |= u16(BIT(v, from[i])) << (9 - i);
+	// native の口では MU の灯（bit 6）の点滅をこちらで作る（led_blink）
+	if (m_native_engine && m_ne_clock >= m_led_off_from && m_ne_clock < m_led_off_until)
+		out &= u16(~(1u << 6));
 	return out;
+}
+
+// **MU の灯を一瞬消す**。firmware は**ノートオン**（強さ 0 は除く）で MU の灯を
+// 消し、受けてから約 38ms 後に消えて約 52ms で点き直す。続けて受けている間は消えたまま
+// （最後に受けてから約 90ms で点く）。プログラムチェンジ・コントロールチェンジ・
+// ノートオフでは消えない。firmware の道で 1ms 刻みに測った（DIN も USB も同じ）。
+// リセットでも消えるが、その間は firmware を回し続けるので firmware 自身が消す
+void mu2000::led_blink(u64 at)
+{
+	constexpr u64 DELAY = 44100 * 38 / 1000, OFF = 44100 * 52 / 1000;
+	if (at >= m_led_off_until)
+		m_led_off_from = at + DELAY;
+	m_led_off_until = std::max(m_led_off_until, at + DELAY + OFF);
 }
 
 
@@ -555,6 +625,36 @@ void mu2000::fill_missing_glyphs(std::vector<u8> &rom)
 			if (!a && !b)
 				continue;              // 0x7f は普通の字
 			bar(0x7f + a * 9 + b, a, b);
+		}
+
+	// **PAN の画面のパンの印**。演奏画面で SELECT を PAN に合わせると、メーターの
+	// 欄が各パートのパンの位置に変わる。firmware の書く字を測ると
+	//
+	//     上の行: 上のレベルメータと同じ棒の字で、R 寄りの量（0-5）を下から伸ばす
+	//             （どちらも 0 なら空白）
+	//     下の行: コード = 0xd0 + 7(a + 1) + b
+	//             a, b = L 寄りの量 0-5。-1 はその側を消す（点滅で選んだパートを
+	//             消すときに使う。1 マスに 2 パート入るので、片側だけ消える）。
+	//             測った字: C/C d7、L1/R1 de、L64/R63 fa、C/L2 d8、R2/L63 dc、
+	//             消/R1 d0、L1/消 dd、L64/消 f9、C/消 d6。両方消すと 0xcf に
+	//             なって上の棒の字と重なるので、それは作らない
+	//
+	// 下の行の字は**いちばん上の段が真ん中**で、そこから下へ a + 1 段点く。
+	// 実機では C が真ん中の 1 段だけ、L に 1 でも寄ると下へ 2 段、R に 1 でも
+	// 寄ると上の行の棒と合わせて上へ 2 段になる（利用者に実機で見てもらった）。
+	// pan 0 は L64 で 5、pan 127 は R63 で 5、1 と 2 はどちらも 1。
+	// 手元の字形 ROM ではこの範囲が全部空白で、C のときに何も出ていなかった
+	for (int a = -1; a <= 5; a++)
+		for (int b = -1; b <= 5; b++) {
+			const int code = 0xd0 + (a + 1) * 7 + b;
+			if (code < 0xd0 || code > 0xff)
+				continue;
+			for (int y = 0; y < 8; y++) {
+				u8 v = 0;
+				if (y <= a) v |= 0x18;
+				if (y <= b) v |= 0x03;
+				rom[code * 16 + y] = v;
+			}
 		}
 
 	// **バンク No.・プログラム No. の前に出る右向きの三角**（利用者が実機を
@@ -836,6 +936,15 @@ void mu2000::build_bus()
 		d.w8 = [this](offs_t, u8 v) { m_ledsw2 = v; };
 		m_bus.add_device(d);
 	}
+	{
+		mem_bus::device d;
+		d.start = 0xd80000; d.end = 0xd80000;
+		d.r8 = [this](offs_t) { return m_d80; };
+		// 下 3bit が LCD のコントラスト（UTIL > SYS の Contrast − 1）。
+		// 上の bit は起動中に a1 / e1 などと動く別のもの（入力の levels か）
+		d.w8 = [this](offs_t, u8 v) { m_d80 = v; };
+		m_bus.add_device(d);
+	}
 
 	// c00000: SmartMedia のデータ、d00000: 制御の留め金（smartmedia.h）
 	{
@@ -941,6 +1050,7 @@ void mu2000::start_devices()
 
 void mu2000::reset()
 {
+	std::memset(m_cc_last, 0xff, sizeof(m_cc_last));
 	// 実機の M37640 は、PC に繋がっていると「ホストが居る」を知らせてくる
 	// （状態の bit6 を立てて F4 03 01 01 01。0x43810 が受け、0x43DAD1 を 1 にする）。
 	// これが来ないと、HOST SELECT が USB のとき firmware は起動の途中（0x1167CE）で
@@ -1321,18 +1431,25 @@ void mu2000::note_fw_swp(bool master, u32 reg, u16 value)
 	// 普通に走っているので、そのときの 0x00 の書き込みが格子の目にあたる
 	if (master && !m_native_engine && reg < 0x1000 && (reg % 64) == 0)
 		m_ndrv.set_eg_phase(u32(trace_sample()));
-	if (!m_native_engine || !master)
+	if (!m_native_engine)
 		return;
+	// リセットが終わったかを測るのに使う（issue #51。hold_after_reset）
+	if (master)
+		m_fw_swp_at = m_ne_clock;
+	// スレーブの声はスロット 64-127（native_driver の SLOTS）
+	const int chip = master ? 0 : 1;
+	const u32 base = master ? 0 : 64;
+	u64 &keymask = m_fw_keymask[chip];
 	// **firmware が鍵を押した瞬間のマスク**を拾う。これが firmware の
 	// 「このスロットを使う」という宣言なので、以後そこは避ける。
 	// あらゆる書き込みで印を付けると、ほとんどのスロットが firmware の
 	// ものになってしまい、かえってぶつかりが増えた
 	switch (reg) {
-	case 0x18e: m_fw_keymask = (m_fw_keymask & ~(u64(0xffff) << 48)) | (u64(value) << 48); return;
-	case 0x18f: m_fw_keymask = (m_fw_keymask & ~(u64(0xffff) << 32)) | (u64(value) << 32); return;
-	case 0x1ce: m_fw_keymask = (m_fw_keymask & ~(u64(0xffff) << 16)) | (u64(value) << 16); return;
-	case 0x1cf: m_fw_keymask = (m_fw_keymask & ~u64(0xffff)) | value; return;
-	case 0x20e: m_ndrv.mark_fw_slots(m_fw_keymask); return;
+	case 0x18e: keymask = (keymask & ~(u64(0xffff) << 48)) | (u64(value) << 48); return;
+	case 0x18f: keymask = (keymask & ~(u64(0xffff) << 32)) | (u64(value) << 32); return;
+	case 0x1ce: keymask = (keymask & ~(u64(0xffff) << 16)) | (u64(value) << 16); return;
+	case 0x1cf: keymask = (keymask & ~u64(0xffff)) | value; return;
+	case 0x20e: m_ndrv.mark_fw_slots(keymask, int(base)); return;
 	default: break;
 	}
 	if (reg >= 0x1000)
@@ -1341,13 +1458,14 @@ void mu2000::note_fw_swp(bool master, u32 reg, u16 value)
 	// MEG の戻りのミキサは毎サンプル書き替わるので数えない
 	if (rr == 0x0e || rr == 0x0f || (rr >= 0x38 && rr <= 0x3f))
 		return;
-	if ((m_ndrv.slot_mask() >> (reg / 64)) & 1) {
+	const u32 slot = base + reg / 64;
+	if (m_ndrv.slot_mask().test(int(slot))) {
 		m_ne_fw_stomp++;
 		static const bool dbg = std::getenv("SMU2000_STOMP_DEBUG") != nullptr;
 		if (dbg)
-			std::fprintf(stderr, "stomp slot=%u reg=%02x value=%04x\n", reg / 64, rr, value);
+			std::fprintf(stderr, "stomp slot=%u reg=%02x value=%04x\n", slot, rr, value);
 		// そこはもう firmware の音が走っている。二重に書かず、譲って避ける
-		m_ndrv.yield_slot(reg / 64);
+		m_ndrv.yield_slot(slot);
 		return;
 	}
 	// **書いたスロットは firmware のものとして避け続ける**（6.220）。
@@ -1357,7 +1475,92 @@ void mu2000::note_fw_swp(bool master, u32 reg, u16 value)
 	// **いま鳴らしているスロットには印を付けない**（上で返している）。
 	// そこはもう取り合いになっていて、避けても今の音は直らないうえ、
 	// 使える枠だけが減って下のほう（firmware が使う側）へ押し出される
-	m_ndrv.mark_fw_slot(reg / 64);
+	m_ndrv.mark_fw_slot(slot);
+}
+
+// firmware が表示を変えた書き込みから、点滅しているマスを覚える
+void mu2000::blink_learn()
+{
+	const hd44780_device::change *ch = nullptr;
+	const int n = m_lcd.changes(ch);
+	for (int i = 0; i < n; i++) {
+		const int at = ch[i].cg ? 0x80 + (ch[i].addr & 0x3f) : (ch[i].addr & 0x7f);
+		blink_cell &c = m_blink[at];
+		const u8 was = ch[i].before, now = ch[i].after;
+		const u64 t = m_fw_clock;
+		const bool pair = c.count && ((was == c.v[0] && now == c.v[1]) ||
+		                              (was == c.v[1] && now == c.v[0]));
+		if (!pair) {
+			// 別の値が来た。ここから数え直す
+			c = blink_cell();
+			c.v[0] = was;
+			c.v[1] = now;
+			c.count = 1;
+			c.last_fw = t;
+			continue;
+		}
+		// was の値が続いた長さ。前に覚えた長さと 25% 以上違えば数え直す
+		const int wi = (was == c.v[0]) ? 0 : 1;
+		const u64 gap = t - c.last_fw;
+		c.last_fw = t;
+		if (c.dur[wi] && (gap * 4 < c.dur[wi] * 3 || gap * 4 > c.dur[wi] * 5)) {
+			c.dur[wi] = gap;
+			c.count = 1;
+			c.on = false;
+			continue;
+		}
+		c.dur[wi] = c.dur[wi] ? (c.dur[wi] * 3 + gap) / 4 : gap;
+		if (c.count < 250)
+			c.count++;
+		const bool sane = c.dur[0] >= 44100 / 50 && c.dur[1] >= 44100 / 50 &&
+		                  c.dur[0] <= 44100 * 2 && c.dur[1] <= 44100 * 2;
+		// 両方の長さが 2 回ずつ揃い、20ms-2 秒に入っていれば点滅とみなす。
+		// 全速の間は firmware の切り替えに位相を合わせ直す
+		if (sane && c.count >= 5 && (!c.on || !m_throttled)) {
+			c.on = true;
+			c.anchor = m_ne_clock;
+			c.anchor_i = u8(1 - wi);
+		}
+	}
+	m_lcd.clear_changes();
+}
+
+const u8 *mu2000::lcd_render()
+{
+	if (!m_native_engine || !m_throttled)
+		return m_lcd.render();
+	// 細く回している間は、覚えた点滅をこちらの時計で切り替えて描き、
+	// 描いたら元に戻す（firmware の思っている画面は変えない）
+	u8 keep[0xC0];
+	bool touched[0xC0] = {};
+	u8 *dd = const_cast<u8 *>(m_lcd.ddram());
+	u8 *cg = const_cast<u8 *>(m_lcd.cgram());
+	for (int at = 0; at < 0xC0; at++) {
+		blink_cell &c = m_blink[at];
+		if (!c.on)
+			continue;
+		const u64 cycle = c.dur[0] + c.dur[1];
+		// firmware の時計で 1 周期半書き換わらなければ、点滅は終わった
+		if (!cycle || m_fw_clock - c.last_fw > cycle * 3 / 2) {
+			c.on = false;
+			continue;
+		}
+		const bool is_cg = at >= 0x80;
+		const int addr = is_cg ? at - 0x80 : at;
+		if (is_cg ? m_lcd.cg_owned(u32(addr)) : m_lcd.owned(u32(addr)))
+			continue;
+		u8 &cell = is_cg ? cg[addr] : dd[addr];
+		const u64 pos = (m_ne_clock - c.anchor) % cycle;
+		const int first = c.anchor_i;
+		keep[at] = cell;
+		touched[at] = true;
+		cell = c.v[pos < c.dur[first] ? first : 1 - first];
+	}
+	const u8 *img = m_lcd.render();
+	for (int at = 0; at < 0xC0; at++)
+		if (touched[at])
+			(at >= 0x80 ? cg[at - 0x80] : dd[at]) = keep[at];
+	return img;
 }
 
 void mu2000::set_native_engine(int mode)
@@ -1369,6 +1572,10 @@ void mu2000::set_native_engine(int mode)
 	// **液晶のマスを firmware に返す**（6.188・6.190）
 	m_lcd.clear_owned();
 	m_lcd.clear_cg_owned();
+	for (blink_cell &c : m_blink)
+		c = blink_cell();
+	m_lcd.clear_changes();
+	m_throttled = false;
 	m_native_engine = mode;
 	m_fw_hold = 0;
 	m_learning = false;
@@ -1432,17 +1639,27 @@ void mu2000::set_native_engine(int mode)
 		// バスの所で記録されるが、こちらは write16 を直に呼ぶので通らない。
 		// 両方を同じ形で残せば、firmware と native の書き込みを 1 つずつ
 		// 突き合わせられる（"N " が native）
+		// **0x1000 から上はスレーブ**（スロット 64-127。native_driver の SLOTS）
+		const bool slave = reg >= 0x1000;
+		if (slave) {
+			reg -= 0x1000;
+			// スレーブの声の出口（0x35-0x37）はマスタと値が違う（native_driver::slave_mixer）
+			const u32 r = reg % 64;
+			if (reg < 0x1000 && r >= 0x35 && r <= 0x37)
+				value = xg::native_driver::slave_mixer(value);
+		}
 		if (m_swp_trace)
-			std::fprintf(m_swp_trace, "N 00800000 %04x %04x  pc=00000000  t=%.6f s=%llu\n",
-			             reg, value, double(trace_sample()) / 44100.0,
+			std::fprintf(m_swp_trace, "N %s %04x %04x  pc=00000000  t=%.6f s=%llu\n",
+			             slave ? "00802000" : "00800000", reg, value, double(trace_sample()) / 44100.0,
 			             (unsigned long long)trace_sample());
-		m_swpm.write16(reg, value);
+		(slave ? m_swps : m_swpm).write16(reg, value);
 	});
 	// **チップの「音程の包絡線が着いた」印**を native の口にも見せる。
 	// 実機の firmware も内部レジスタ 4 の bit14 で同じものを見ている（0x12B81C）
-	m_ndrv.set_peg_peek([this](int chan) { return m_swpm.peg_reached(chan); });
-	m_ndrv.set_slot_peek([this](int chan) { return m_swpm.slot_active(chan); });
-	m_ndrv.set_slot_held([this](int chan) { return !m_swpm.slot_freed(chan); });
+	// スロット 64-127 はスレーブの声 0-63
+	m_ndrv.set_peg_peek([this](int chan) { return (chan < 64 ? m_swpm : m_swps).peg_reached(chan & 63); });
+	m_ndrv.set_slot_peek([this](int chan) { return (chan < 64 ? m_swpm : m_swps).slot_active(chan & 63); });
+	m_ndrv.set_slot_held([this](int chan) { return !(chan < 64 ? m_swpm : m_swps).slot_freed(chan & 63); });
 }
 
 // 音色の 1 音目を firmware に鳴らさせて、スロットに書かれた値を写し取る
@@ -1513,12 +1730,12 @@ void mu2000::native_learn_start(u32 rec)
 				// **firmware がこちらの鳴っているスロットを取ったか**を見る。
 				// firmware は native の使用中を知らないので、声が増えると
 				// 奪い合いになり、写し取りに 2 つの音の値が混ざる
-				if (const u64 clash = m_learn_mask & m_ndrv.slot_mask()) {
+				if (const u64 clash = m_learn_mask & m_ndrv.slot_mask().w[0]) {
 					m_ne_slot_clash++;
 					if (std::getenv("SMU2000_NATIVE_DEBUG"))
 						std::fprintf(stderr, "スロットの奪い合い: firmware=%016llx native=%016llx 重なり=%016llx\n",
 						             (unsigned long long)m_learn_mask,
-						             (unsigned long long)m_ndrv.slot_mask(),
+						             (unsigned long long)m_ndrv.slot_mask().w[0],
 						             (unsigned long long)clash);
 				}
 				m_learn_keyed |= m_learn_mask;
@@ -2029,6 +2246,14 @@ void mu2000::draw_meter()
 		m_lcd.clear_owned();
 		return;
 	}
+	// **演奏画面だけ**。VOL・EXP・REV・CHO・VAR の画面でも firmware は同じ
+	// 欄へ同じ棒の字で各パートの値を描くので、棒の字かどうかでは見分けられず、
+	// 上から音量メーターを描いて値を消していた。演奏画面は下の行 9 桁目が
+	// バンク番号の前の三角（0x10 / 0x11）、値の画面はそこが '='
+	if (cur[0x49] != 0x10 && cur[0x49] != 0x11) {
+		m_lcd.clear_owned();
+		return;
+	}
 	// **上と下は別々に見る**。演奏画面には「上の行が棒の続きではなく数字」の
 	// 形もあって（パネルで `play` を押したあとの画面）、まとめて見ると
 	// 下の棒まで描けなくなる
@@ -2295,6 +2520,33 @@ void mu2000::native_select_voice(int part)
 // 送りや音量を決める打ち込みは珍しくない）で、firmware がその SysEx を
 // 処理し終えるまで native が古い値のまま鳴らしていた。native の口では
 // firmware を 100ms につき 5ms しか回さないので、その遅れは 1 秒を超える
+// issue #51 の調べ用（`SMU2000_RESET_DEBUG=1`）。**環境は 1 回だけ読む**
+// （毎回 getenv を呼ぶと per-event の道が重くなる。6.225 の教訓）
+static bool reset_debug()
+{
+	static const bool on = std::getenv("SMU2000_RESET_DEBUG") != nullptr;
+	return on;
+}
+
+
+// リセット（GM・GS・XG）を受けたら、firmware がそれを処理し終えるまで
+// こちらの発音を待たせる（issue #51）。ここまでに並んでいた分（リセット自身を含む）は
+// そのまま流してよい。解くのは native_pump の呼び出し元（run_sample）
+void mu2000::hold_after_reset(u64 fire)
+{
+	if (reset_debug())
+		std::fprintf(stderr, "[reset] 待たせ始め fire=%llu ne_clock=%llu 並び=%zu\n",
+		             (unsigned long long)fire, (unsigned long long)m_ne_clock, m_nq.size());
+	m_ne_reset_hold = true;
+	m_ne_reset_free = m_nq.size();
+	const u64 now = fire > m_ne_clock ? fire : m_ne_clock;
+	const u64 deadline = now + RESET_HOLD_MAX;
+	if (deadline > m_ne_reset_deadline)
+		m_ne_reset_deadline = deadline;
+	m_fw_swp_at = now;                       // まだ静かになっていない、から始める
+}
+
+
 void mu2000::native_sysex(u64 fire)
 {
 	// **リセットは native にも効かせる**（6.136）。GM システムオン
@@ -2304,11 +2556,13 @@ void mu2000::native_sysex(u64 fire)
 	// **ヤマハの判定より前に見る**（GM と GS は 43 で始まらない）
 	if (m_sx_pos >= 3 && m_sx[0] == 0x7e && m_sx[2] == 0x09) {
 		m_nq.push_back({ fire, 6, 0, 0, 0 });
+		hold_after_reset(fire);
 		return;
 	}
 	if (m_sx_pos >= 7 && m_sx[0] == 0x41 && m_sx[2] == 0x42 &&
 	    m_sx[4] == 0x40 && m_sx[6] == 0x7f) {
 		m_nq.push_back({ fire, 6, 0, 0, 0 });
+		hold_after_reset(fire);
 		return;
 	}
 	if (m_sx_pos < 7)
@@ -2318,6 +2572,7 @@ void mu2000::native_sysex(u64 fire)
 	const u8 hh = m_sx[3], mm = m_sx[4], ll = m_sx[5];
 	if (hh == 0x00 && mm == 0x00 && (ll == 0x7e || ll == 0x7f)) {
 		m_nq.push_back({ fire, 6, 0, 0, 0 });
+		hold_after_reset(fire);
 		return;
 	}
 	// **ドラムのセットアップは SysEx（3n rr pp）では渡さない**（6.180）。
@@ -2346,11 +2601,20 @@ void mu2000::native_sysex(u64 fire)
 void mu2000::native_pump()
 {
 	while (!m_nq.empty() && m_nq.front().at <= m_ne_clock) {
+		// リセットが効き終わるまでは、そのあとに並んだものを止めておく
+		if (m_ne_reset_hold) {
+			if (m_ne_reset_free == 0)
+				break;
+			m_ne_reset_free--;
+		}
 		const nev e = m_nq.front();
 		m_nq.pop_front();
 		switch (e.kind) {
 		case 0: m_ndrv.note_off(e.part, e.d0); break;
 		case 1:
+			if (reset_debug())
+				std::fprintf(stderr, "[reset] 打鍵 part=%d note=%d ne_clock=%llu\n",
+				             e.part, e.d0, (unsigned long long)m_ne_clock);
 			if (m_ndrv.note_on(e.part, e.d0, e.d1))
 				m_ne_stats.note_native++;
 			break;
@@ -2396,6 +2660,7 @@ void mu2000::native_pump()
 				m_prog_seen[p][0] = m_prog_seen[p][1] = m_prog_seen[p][2] = 0xff;
 			}
 			std::memset(m_nown, 0, sizeof(m_nown));
+			std::memset(m_cc_last, 0xff, sizeof(m_cc_last));   // CC の控えも忘れる
 			m_ndrv.reset_parts();
 			// **音色の記録も引き直す**。m_prog_sel を戻すだけでは、
 			// 口が持っている記録（`set_record`）が古いままになる
@@ -2567,6 +2832,8 @@ bool mu2000::native_midi(u8 byte, int port)
 		return true;
 	}
 	n.have = 0;
+	if (kind == 0x90 && (byte & 0x7f))
+		led_blink(fire);                  // MU の灯（leds）
 	// **受信チャンネル**（08 pp 04。6.150）。既定はパート = チャンネル + 口 x 16
 	// だが、曲が付け替えることがある。聞いているパートが無いときは実機も
 	// 黙るので何もせず、2 つ以上のときは重ねて鳴るので firmware に任せる
@@ -2595,6 +2862,16 @@ bool mu2000::native_midi(u8 byte, int port)
 	if (kind == 0xb0) {
 		m_ne_stats.other++;
 		const int cc = n.d0 & 0x7f;
+		// **値の変わらない CC は firmware を起こし直さない**。
+		// 受けるたびに意味が変わるもの（データ入力・RPN/NRPN の指定・増減・
+		// チャンネルモード）は対象にしない。バイトは下でいつもどおり流すので、
+		// 線の時間も firmware の状態も変わらない
+		const bool cc_stateful = cc == 6 || cc == 38 || (cc >= 96 && cc <= 101) || cc >= 120;
+		bool cc_same = false;
+		if (!cc_stateful) {
+			cc_same = m_cc_last[part][cc] == (byte & 0x7f);
+			m_cc_last[part][cc] = u8(byte & 0x7f);
+		}
 		if (cc == 0x00) m_nq.push_back({ fire, 4, u8(part), 0, u8(byte & 0x7f) });
 		if (cc == 0x20) m_nq.push_back({ fire, 4, u8(part), 1, u8(byte & 0x7f) });
 		const bool mine = m_ndrv.handles_cc(n.d0 & 0x7f);
@@ -2611,7 +2888,8 @@ bool mu2000::native_midi(u8 byte, int port)
 		// まだ写し取っていないパートは、1 音目を firmware が鳴らすので、
 		// CC も firmware に効かせてもらう
 		const bool quick = mine && !m_fw_notes[part] && m_ndrv.part_learned(part);
-		m_fw_hold = std::max(m_fw_hold, u32(quick ? 44100 / 500 : 44100 / 50));
+		if (!cc_same)
+			m_fw_hold = std::max(m_fw_hold, u32(quick ? 44100 / 500 : 44100 / 50));
 		replay_note(n.status, n.d0, byte, port);
 		return true;
 	}
@@ -2863,7 +3141,8 @@ void mu2000::run_sample(s32 &left, s32 &right)
 	if (m_nfx_on && !(++m_nfx_tick & 0x1ff))
 		native_fx_update();
 	// 画面がパートの音を見ているときは、声 → パートを 256 サンプル（6ms）ごとに読み直す
-	if (m_scope_part.load(std::memory_order_relaxed) >= 0 && !(++m_scope_tick & 0xff))
+	if ((m_scope_part.load(std::memory_order_relaxed) >= 0 || m_pscope_on.load(std::memory_order_relaxed)) &&
+	    !(++m_scope_tick & 0xff))
 		scope_refresh_owner();
 
 	// 台数が変わっていたら別スレッドの使い方を見直す（8192 サンプルごと）
@@ -2889,7 +3168,11 @@ void mu2000::run_sample(s32 &left, s32 &right)
 	//   * そのあと少しの間（処理が終わるまで）
 	// だけ。ふだんは止めておく
 	bool run_cpu = m_cpu_enabled;
+	// 内訳をもう一段割る（m_t_ndrv / m_t_nemisc / m_t_sh2）。測るときだけ読む
+	u64 pn0 = 0, pn1 = 0;
 	if (m_native_engine) {
+		if (m_profile)
+			pn0 = smu2000::perf_ticks();
 		m_ne_samples.fetch_add(1, std::memory_order_relaxed);
 		// firmware が鳴らしている音がある間は止めない。LFO・包絡線・ベンドの
 		// 追従をやっているのは firmware なので、止めるとその音だけ変わってしまう。
@@ -2913,6 +3196,9 @@ void mu2000::run_sample(s32 &left, s32 &right)
 		// 100ms ごとに 5ms だけ回す。止まりっぱなしにしないのが目的なので、
 		// これで十分（パネルの反応は 100ms 以内、CPU は数 % 増えるだけ）
 		if (m_ne_clock % KEEPALIVE_EVERY == 0) {
+			// 直前の 100ms に firmware が半分も回っていなければ、細く回している
+			m_throttled = (m_fw_clock - m_thr_fw0) < KEEPALIVE_EVERY / 2;
+			m_thr_fw0 = m_fw_clock;
 			m_fw_hold = std::max(m_fw_hold, KEEPALIVE_RUN);
 			if (!m_fw_why)
 				m_fw_why = 5;
@@ -2964,7 +3250,7 @@ void mu2000::run_sample(s32 &left, s32 &right)
 			}
 			// **調べ用**（`SMU2000_METER_DBG=1`）。draw_meter の前の
 			// 液晶の中身と、目盛り（生 / なまし）を出す
-			if (std::getenv("SMU2000_METER_DBG")) {
+			if (m_meter_dbg) {
 				const u8 *dd = m_lcd.ddram();
 				std::fprintf(stderr, "MTR %.3f",
 				             double(m_ne_clock) / 44100.0);
@@ -2993,7 +3279,7 @@ void mu2000::run_sample(s32 &left, s32 &right)
 		// `SMU2000_FW_ALWAYS=1` で **native の口でも SH-2 を止めない**。
 		// 止めると firmware の打鍵が 1 サンプル後ろへずれるのを見つけた
 		// ときの道具（doc/native-engine.md の 6.153）。ふだんは使わない
-		} else if (!std::getenv("SMU2000_FW_ALWAYS")) {
+		} else if (!m_fw_always) {
 			run_cpu = false;
 		}
 		if (run_cpu) {
@@ -3027,14 +3313,53 @@ void mu2000::run_sample(s32 &left, s32 &right)
 			}
 		}
 		m_ne_clock++;
+		// **リセットが効き終わったら解く**（issue #51）。firmware が SWP30 を
+		// 20ms 触らなくなったら終わったとみなす。取り逃しても 400ms で必ず解く
+		if (m_ne_reset_hold &&
+		    (m_ne_clock >= m_ne_reset_deadline ||
+		     (m_ne_clock > m_fw_swp_at && m_ne_clock - m_fw_swp_at >= RESET_QUIET))) {
+			m_ne_reset_hold = false;
+			// **間隔を保ったままずらす**。溜めた分を一度に鳴らすと、線の上で
+			// 1 ミリ秒ずつずれていた和音が完全に揃ってしまい、音が大きくなる
+			// （firmware の道より +1.7dB になった）
+			if (!m_nq.empty() && m_nq.front().at < m_ne_clock) {
+				const u64 delta = m_ne_clock - m_nq.front().at;
+				for (nev &e : m_nq)
+					e.at += delta;
+			}
+			if (reset_debug())
+				std::fprintf(stderr, "[reset] 解いた ne_clock=%llu（期限=%llu 最後の SWP=%llu）残り=%zu\n",
+				             (unsigned long long)m_ne_clock, (unsigned long long)m_ne_reset_deadline,
+				             (unsigned long long)m_fw_swp_at, m_nq.size());
+		}
 		if (!m_nq.empty())
 			native_pump();
+		if (m_profile)
+			pn1 = smu2000::perf_ticks();
 		m_ndrv.tick(m_ne_clock);
 		if (m_traj_rec)
 			traj_step();
+		if (m_profile) {
+			const u64 pn2 = smu2000::perf_ticks();
+			m_t_ndrv += pn2 - pn1;
+			m_t_nemisc += pn1 - pn0;
+		}
 	}
-	if (run_cpu)
-		run_cycles(cycles);
+	if (run_cpu) {
+		m_fw_clock++;
+		if (m_profile) {
+			const u64 pc0 = smu2000::perf_ticks();
+			run_cycles(cycles);
+			m_t_sh2 += smu2000::perf_ticks() - pc0;
+			m_n_sh2++;
+		} else
+			run_cycles(cycles);
+		// firmware が液晶を書き換えていれば、点滅かどうかを覚える
+		if (m_native_engine)
+			blink_learn();
+		else
+			m_lcd.clear_changes();
+	}
 
 	if (m_profile) {
 		pt1 = smu2000::perf_ticks();
@@ -3094,6 +3419,12 @@ void mu2000::run_sample(s32 &left, s32 &right)
 	// スレーブの DAC はどこにも繋がっていない
 	left  = lm;
 	right = rm;
+	// 一覧のマスターのスペクトラム（最終の出力、左右の平均）
+	if (m_pscope_on.load(std::memory_order_relaxed)) {
+		const u32 w = m_oscope_w.load(std::memory_order_relaxed);
+		m_oscope[w & (PSCOPE_N - 1)] = (float(lm) + float(rm)) * 0.5f;
+		m_oscope_w.store(w + 1, std::memory_order_release);
+	}
 }
 
 // ---- 状態の保存と復元
@@ -3105,7 +3436,7 @@ namespace {
 
 // 保存の形。中身の並びを変えたら上げる
 constexpr u32 STATE_MAGIC   = 0x554d3253;   // "S2MU"
-constexpr u32 STATE_VERSION = 12;  // 2: MIDI の入口が A/B の 2 口になった / 3: SWP30 のピッチ EG / 4: サンプリングの録音の位置 / 5: SmartMedia の命令の途中 / 6: MEG の印と 2 つ目の idx / 7: USB の口（C・D）の受け取り途中 / 8: 2 つ目の A/D 変換器（AN4 = HOST SELECT） / 9: SWP30 の書き込みの待ち / 10: USB のコマンド（M37640 からの知らせ） / 11: 液晶の「native の持ち物」（6.188） / 12: 外字の「native の持ち物」（6.190）
+constexpr u32 STATE_VERSION = 13;  // 13: d80000（LCD のコントラスト） / 2: MIDI の入口が A/B の 2 口になった / 3: SWP30 のピッチ EG / 4: サンプリングの録音の位置 / 5: SmartMedia の命令の途中 / 6: MEG の印と 2 つ目の idx / 7: USB の口（C・D）の受け取り途中 / 8: 2 つ目の A/D 変換器（AN4 = HOST SELECT） / 9: SWP30 の書き込みの待ち / 10: USB のコマンド（M37640 からの知らせ） / 11: 液晶の「native の持ち物」（6.188） / 12: 外字の「native の持ち物」（6.190）
 constexpr u32 STATE_VERSION_OLDEST = 2;
 
 } // namespace
@@ -3195,6 +3526,12 @@ void mu2000::state(state_io &s)
 			s.v(m_usb.cur_cmd);
 		}
 	}
+
+	// 版 13 から: d80000 の値（LCD のコントラスト）
+	if (s.version() >= 13) {
+		s.tag("d80");
+		s.v(m_d80);
+	}
 }
 
 u32 mu2000::state_version()
@@ -3216,6 +3553,8 @@ std::vector<u8> mu2000::save_state() const
 
 bool mu2000::load_state(const u8 *p, size_t n, std::string &err)
 {
+	// 読み戻したら CC の控えは忘れる（線で見た値と、機械の中身が合わなくなるので）
+	std::memset(m_cc_last, 0xff, sizeof(m_cc_last));
 	state_io s(p, n);
 	u32 magic = 0, ver = 0;
 	s.v(magic);

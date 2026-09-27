@@ -39,6 +39,7 @@ struct snapshot {
 	u8   dots[LCD_ROWS * LCD_COLS * CELL_H] = {};   // 各バイトの下位 5bit
 	u16  leds = 0;
 	bool lcd_on = false;
+	u8   contrast = 2;           // UTIL > SYS の Contrast（1-8）
 	bool ready = false;          // 起動が終わったか
 	char message[96] = {};       // 起動中／ROM が無い等。空なら出さない
 	// 鳴っている声の数（SWP30 のマスタとスレーブ、それぞれ 64 スロット）
@@ -61,6 +62,10 @@ struct xg_snapshot {
 	// 入ってきた MIDI から。口×チャンネル（口 * 16 + ch）ごと。パートとの対応は受信チャンネルで
 	u64 notes[XG_PARTS][2] = {};                     // 押さえている鍵
 	u8  velocity[XG_PARTS] = {};                     // 最後のノートオンの強さ
+	// **ピッチベンド**。真ん中からの離れ（-8192〜+8191）で持つので、既定の 0 が真ん中。
+	// 入ってきた MIDI から取る。**式だけの口では firmware にベンドを渡さない**ので、
+	// ワーク RAM の PART_BEND は動かない（doc/native-engine.md の 6.227）
+	s16 bend[XG_PARTS] = {};
 	u32 note_ons[XG_PARTS] = {};                     // ノートオンの回数（画面がメーターを振る合図）
 };
 

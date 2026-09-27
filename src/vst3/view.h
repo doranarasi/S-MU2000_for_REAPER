@@ -8,10 +8,6 @@
 // The child window itself now lives per platform behind plug_window.h, so this
 // header mentions no window system at all.
 //
-// This header deliberately mentions no window system at all. The panel is held
-// behind a pimpl because ui::panel needs compat/gdi.h, and view_mac.mm has to
-// include this header next to Cocoa -- where BOOL and Polygon mean something
-// else entirely. The per-platform window lives behind plug_window.h.
 
 #ifndef S_MU2000_VST3_VIEW_H
 #define S_MU2000_VST3_VIEW_H
@@ -35,7 +31,7 @@ class plug_window;
 // mu2000::button value -> plug_key for the panel keys (view.cpp): the reverse
 // of its button_of(), for platform windows that share their letter map through
 // ui/keymap.h. int because mu2000.h is too heavy for this header (MAME CPU
-// headers next to Cocoa). Returns PLUG_KEY_NONE for anything that is not
+// headers next to Objective-C). Returns PLUG_KEY_NONE for anything that is not
 // a panel key.
 plug_key plug_key_of_button(int button);
 
@@ -69,10 +65,12 @@ public:
 	// ---- Called by the platform window (view_win.cpp / view_mac.mm).
 	//
 	// `native` is whatever that platform paints into: an HDC on Windows, a
-	// CGContextRef on macOS. Both are opaque here, which is what lets the
-	// Cocoa file compile without compat/gdi.h
+	// CGContextRef on macOS.
 	int  width() const { return m_w; }
 	int  height() const { return m_h; }
+	// 開く前の大きさ（VST2 は窓を作る前に聞いてくる）。1000 × (400 + 上の帯)
+	static int default_width();
+	static int default_height();
 
 	void repaint(void *native, int w, int h);
 	void mouse_down(int x, int y);
@@ -110,7 +108,8 @@ private:
 
 	// When the card was last written back, in milliseconds
 	uint64_t m_last_flush = 0;
-	int m_w = 1400, m_h = 360;
+	// gui.exe と同じ既定の幅。高さはコンストラクタで 1000:400 ＋ 上の帯
+	int m_w = 1000, m_h = 400;
 	Steinberg::int32 m_refs = 1;
 	Steinberg::IPlugFrame *m_frame = nullptr;
 };

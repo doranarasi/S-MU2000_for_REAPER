@@ -5,8 +5,7 @@
 // platform (view_win.cpp, view_mac.mm), reached through plug_window.h.
 //
 // This file is plain C++ and includes compat/gdi.h, which is what paints the
-// panel on both platforms. On macOS that means CoreGraphics is fine to include
-// here too -- it is Cocoa, not CoreGraphics, that clashes with the GDI shim.
+// panel on both platforms.
 
 #include "view.h"
 #include "plug_window.h"
@@ -153,8 +152,9 @@ struct plug_view::impl
 plug_view::plug_view(engine &eng)
 	: m_impl(new impl(eng)), m_engine(eng)
 {
-	// パネルの配置。%LOCALAPPDATA%\S-MU2000\panel.txt があれば読む
-	// （doc/panel-editing.md）。無ければ組み込みの配置のまま
+	// パネルの配置。%LOCALAPPDATA%\S-MU2000\panel.txt があれば読む。無ければ
+	// 束の中の写真調の絵（Resources/panel）、それも無ければ組み込みの配置
+	// （doc/panel-editing.md）
 	//
 	// find_default() now searches the per-user settings directory on either
 	// platform (~/Library/Application Support/S-MU2000 on macOS)
@@ -170,8 +170,13 @@ plug_view::plug_view(engine &eng)
 	m_impl->panel.xg().set_raw_listener([&eng](u32 addr, int size, int value) {
 		eng.notify_edit_raw(addr, size, value);
 	});
+	// 絵は 1000:400、その上の帯（一覧・エディタ…）は比の外に足す
+	m_h = m_w * ui::LOGICAL_H / ui::LOGICAL_W + m_impl->panel.top_inset();
 	m_impl->panel.resize(m_w, m_h);
 }
+
+int plug_view::default_width()  { return ui::LOGICAL_W; }
+int plug_view::default_height() { return ui::LOGICAL_H + ui::toolbar::HEIGHT; }
 
 plug_view::~plug_view()
 {
@@ -275,9 +280,10 @@ tresult PLUGIN_API plug_view::checkSizeConstraint(ViewRect *rect)
 {
 	if (!rect)
 		return kInvalidArgument;
-	// 横に長い機械なので、縦横比はこちらで決めてしまう
+	// 横に長い機械なので、縦横比はこちらで決めてしまう。上の帯は比の外に
+	// 足す（gui.exe の窓と同じ）。足さないと絵が高さで決まって左右が余る
 	const int w = std::max<int32>(rect->getWidth(), 640);
-	const int h = std::max<int32>(w * ui::LOGICAL_H / ui::LOGICAL_W, 180);
+	const int h = std::max<int32>(w * ui::LOGICAL_H / ui::LOGICAL_W + m_impl->panel.top_inset(), 180);
 	rect->right = rect->left + w;
 	rect->bottom = rect->top + h;
 	return kResultTrue;
@@ -431,7 +437,7 @@ void plug_view::card_make(const std::string &path, int mb)
 	std::string err;
 	smartmedia card;
 	if (!card.create(u32(mb)) || !card.save(path, err)) {
-		card_error(err.empty() ? "SmartMedia を作れない" : err);
+		card_error(err.empty() ? UI_TEXT(dlg_card_create_fail, "Cannot create the SmartMedia image") : err);
 		return;
 	}
 	if (!m_engine.card_insert(path, err)) {
@@ -442,8 +448,8 @@ void plug_view::card_make(const std::string &path, int mb)
 	// on the machine before it holds anything. gui.cpp says the same thing when
 	// one is made there
 	if (m_window)
-		m_window->alert("空の SmartMedia を差しました。\n"
-		                "使う前に、本体の UTIL → CARD → Format で書式化してください。");
+		m_window->alert(UI_TEXT(dlg_fresh_card, "Inserted a blank SmartMedia image.\n"
+		                                        "Before use, format it on the machine: UTIL → CARD → Format."));
 }
 
 void plug_view::card_insert_path(const std::string &path)

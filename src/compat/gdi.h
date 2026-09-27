@@ -36,12 +36,18 @@
 
 // ---- Base types
 
+// So we don't collide with the old Quickdraw Polygon
+#define Polygon GdiPolygon
+
 using BYTE  = uint8_t;
 using WORD  = uint16_t;
 using DWORD = uint32_t;
 using UINT  = uint32_t;
 using INT   = int32_t;
-using BOOL  = int;
+// bool, agreeing with objc/objc.h's BOOL, so this header can share a
+// translation unit with Cocoa. Nothing here depends on int-ness: the
+// functions return TRUE/FALSE and callers ignore the result.
+using BOOL  = bool;
 using UINT_PTR = uintptr_t;
 
 // LONG is `long`, as it is in the Windows headers, rather than a fixed
@@ -181,6 +187,11 @@ BOOL LineTo(HDC dc, int x, int y);
 BOOL Polygon(HDC dc, const POINT *pts, int n);
 BOOL PolyPolygon(HDC dc, const POINT *pts, const INT *counts, int n);
 BOOL Polyline(HDC dc, const POINT *pts, int n);
+
+// Not GDI: pastes w x h pixels at (x, y), each 0xAARRGGBB with alpha already
+// multiplied in (the layout Cairo's ARGB32 and a little-endian CGImage use).
+// Windows does the same through GdiAlphaBlend (see ui/svg.cpp)
+BOOL smu_blit_premul(HDC dc, int x, int y, int w, int h, const uint32_t *px);
 
 COLORREF SetTextColor(HDC dc, COLORREF color);
 int      SetBkMode(HDC dc, int mode);

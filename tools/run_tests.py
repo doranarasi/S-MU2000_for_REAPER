@@ -146,6 +146,25 @@ class Buffered(Report):
         self.lines.append(line)
 
 
+def step_texts(rep):
+    """ROM 不要。画面の言葉（src/ui/texts*.h）に抜けや書式の食い違いが無いか。
+    tools/check_texts.py の中身そのまま。訳の %s が %d になっていると落ちる"""
+    script = ROOT / "tools" / "check_texts.py"
+    if not script.exists():
+        rep.add("画面の言葉", False, "tools/check_texts.py が無い")
+        return
+    got = subprocess.run([sys.executable, str(script)], capture_output=True,
+                         text=True, encoding="utf-8")
+    last = [l for l in (got.stdout or "").splitlines() if l.strip()]
+    if got.returncode == 0:
+        rep.add("画面の言葉", True, last[-1] if last else "")
+        return
+    rep.add("画面の言葉", False, "食い違いがある")
+    for line in last:
+        if line.startswith("FAIL"):
+            print("    %s" % line)
+
+
 def step_verify(rep, update):
     """ROM 不要。swp30 を素で叩いて、レジスタと乱数が動いているか"""
     exe = tool("verify")
@@ -336,6 +355,13 @@ SHAPE_LOW = {
     # **-1 サンプルずらすと 100.0%**（音量差 0.00dB・左右も一致）。
     # 5・6・7 秒目が 28.8/28.2/49.6% → 100.0/100.0/99.6%
     "drumnrpn": 0.25,
+    # **曲頭にリセットと打鍵が同時に並ぶ形**（issue #51）。ここは波形の位置を
+    # 見ない。firmware はリセットを処理しながら鍵を拾うが、こちらは「firmware が
+    # 静かになってから」まとめて鳴らすので、始まりが数ミリ秒ずれる。
+    # **-3.4ms ずらすと 94.8%**（ずらさないと -10.9%）。
+    # この試験が見たいのは**曲頭が丸ごと消えないこと**で、それは音量の側が見る
+    # （消えていたときは firmware より -37dB だった。いまは +1.25dB）
+    "headrace": -0.5,
     # **写し取りが足りないまま鳴らす**のが狙いの試験（6.219）。2 つ目の要素は
     # 記録が無く式だけで組むので、重なった 2 枚のうなりの位相が合わず、
     # 最後の 2 秒だけ相関が負になる（測値 -20%）。**大きさは合っている**
@@ -344,6 +370,9 @@ SHAPE_LOW = {
 }
 
 SHAPE_MIN = {
+    # **headrace は波形の位置を見ない**（issue #51。下の SHAPE_LOW に理由）。
+    # 見張るのは音量の側（消えていたときは -37dB）
+    "headrace": -0.5,
     "piano":   0.98, "chord":  0.95, "drums": 0.95, "effects": 0.98,
     "dense":   0.55, "port_b": 0.98, "bend":  0.98, "lofi":    0.98,
     "egcc":    0.98, "porta":  0.95, "at":    0.95, "sxparam": 0.95,
@@ -375,6 +404,12 @@ SHAPE_MIN = {
     "xgsys": 0.95,
     # 短い音で写し取ったあとの、遅れて掛かるビブラート（6.217）
     "xgvibshort": 0.95,
+    # ビブラートの遅れのつまみ（6.232）
+    "xgvibdly": 0.95,
+    # 逆向きに鳴らすサンプル（6.233）
+    "drumrev": 0.95,
+    # SFX キット（6.234）
+    "drumsfx": 0.95,
     # meter は 15 パートを同時に鳴らすので dense と同じ事情で形が落ちる
     # （狙いは液晶のほうなので、音は緩めに見る）
     "meter": 0.90, "filtcc": 0.95, "keyrange": 0.95, "rcvch": 0.95, "althh": 0.95, "drumrcv": 0.95,
@@ -871,6 +906,10 @@ def main():
 
     print("== 1. verify（ROM 不要）")
     step_verify(rep, a.update)
+
+    print()
+    print("== 1b. 画面の言葉（ROM 不要）")
+    step_texts(rep)
 
     roms = find_roms(a.roms)
     if roms is None:

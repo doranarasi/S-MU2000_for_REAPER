@@ -836,6 +836,68 @@ def case_kits():
     return [track(seq(ev))], t + 3.0
 
 
+def case_drumsfx():
+    """**SFX キット**（バンク MSB 126）。6.234。
+
+    SFX の打の記録は、ふつうの打と違って**波形が埋まっていない**（+24/+25 が
+    `FFFF` でなく索引で、+26 から先は 0）。native の口はそれを
+    そのまま式に通していたので、波形の番地が 0 になって雑音が鳴っていた。
+    いまは索引で音色記録の表（0x283B50）を引き、**旋律の道で鍵 64 として組む**
+    （実機と同じ）。ここが崩れると native の形が落ちる。
+
+    SFX Kit1（プログラム 0）と SFX Kit2（プログラム 1）から数鍵ずつと、
+    巻き添えを見るために**ふつうのキット**（MSB 127）も続けて鳴らす。
+
+    鍵は**大きく鳴って持続するもの**を選ぶ（実機の 100ms 以降の rms が 500 以上）。
+    静かな打や、離しで 100ms で消える打は量子化雑音どうしの相関を測ることになり、
+    合っていても 60% ほどにしかならない（そこで一度はまった）。
+    74 は 2 要素で片方が byte72（要素の遅れ）= 1 の打。
+    """
+    ev = head()
+    t = 1.0
+    for prog, keys in ((0, (74, 73, 90, 87, 68)), (1, (88, 62, 86))):
+        ev += [(t, b'\xb9\x00\x7e'), (t + 0.02, b'\xb9\x20\x00'),
+               (t + 0.04, bytes([0xc9, prog]))]
+        t += 0.2
+        for k in keys:
+            ev += note(9, k, 110, t, 0.3)
+            t += 0.45
+        t += 0.2
+    # ふつうのキットに戻して、そちらが native のままかを見る
+    ev += [(t, b'\xb9\x00\x7f'), (t + 0.02, b'\xb9\x20\x00'), (t + 0.04, b'\xc9\x00')]
+    t += 0.2
+    for k in (36, 38, 42):
+        ev += note(9, k, 110, t, 0.1)
+        t += 0.45
+    return [track(seq(ev))], t + 1.0
+
+
+def case_drumrev():
+    """**逆向きに鳴らすサンプル**（波形の記録の `0x14/0x15` の bit31。6.233）。
+
+    チップは後ろから読むので「ループまでの数」と「ループの長さ」の役割が
+    入れ替わる。native の口は記録のまま書いていたので、長さ 1 で止まって
+    **音程は合っているのにざらついた音**になっていた。
+
+    * StandKit#（キット 1）の鍵 47・48・50 … Mid Tom L/H・High Tom
+    * AnalogKit（キット 24）の鍵 28
+    * 同じキットの 41・43・45（ふつうのタム）を対で入れて、巻き添えを見る
+
+    `kits` は 36・38・42 しか打っていなかったので、ここは一度も通っていなかった。
+    """
+    ev = head()
+    t = 1.0
+    for kit, keys in ((1, (41, 43, 45, 47, 48, 50)), (24, (26, 28, 30))):
+        ev += [(t, b'\xb9\x00\x7f'), (t + 0.02, b'\xb9\x20\x00'),
+               (t + 0.04, bytes([0xc9, kit]))]
+        t += 0.2
+        for k in keys:
+            ev += note(9, k, 110, t, 0.1)
+            t += 0.45
+        t += 0.3
+    return [track(seq(ev))], t + 1.0
+
+
 def case_ins2():
     """**インサーションを 2 系統**、別々のパートに掛ける。
     `lofi` は 1 系統だけ。2 つ目（02 01 60-）の番地と、パートごとの
@@ -1578,6 +1640,39 @@ def case_xgvibshort():
         t += 3.6
     return [track(seq(ev))], t + 1.0
 
+def case_xgvibdly():
+    """**ビブラートの遅れのつまみ**（08 pp 17 ＝ NRPN 01 0A。6.232）。
+
+    firmware は 20ms の目盛りの表を引いて、**速さ・深さと同じ「大小で選ぶ」**形で
+    音色自身の遅れ（byte12）と混ぜる。つまみ 64 なら音色のまま、下なら小さいほう、
+    上なら大きいほう。native の口は 08 pp 17 を覚えるだけで使っていなかったので、
+    Vib Delay を動かしても音が変わらなかった（絵の「掛かり始め」の線も動かなかった）。
+    さらに、つまみで遅れが付くと **自身はせり上がらない音色でも遅れて掛かる**。
+
+    * Shakuhachi … 自身 33 目盛り（665ms）。つまみ 0/48 は表が勝ち、80 は自身が勝つ
+    * GrandPno（Vib Depth 88）… 自身はせり上がらない。つまみ 80 で 18 目盛りの遅れが付く
+    * Vibes … 音量側の揺れ（レジスタ `0x05`）が遅れる側
+
+    **パートは順に鳴らす**（xghpf と同じ事情）。3 つ同時だと native の形が遅れとは
+    関係なく 85% まで落ちて、遅れが効かなくなっても気づけない試験になる。
+    1 パートずつなら firmware と 99-100% 合う
+    """
+    ev = head()
+    for ch, pg in enumerate((77, 0, 11)):              # Shakuhachi / GrandPno / Vibes
+        ev += [(1.0, bytes([0xc0 | ch, pg]))]
+    ev += [(1.1, xg([0x08, 0x01, 0x16, 88]))]          # GrandPno は深さを足して揺らす
+    t = 1.3
+    for ch in range(3):
+        ev += note(ch, 60, 100, t, 0.4)                # 1 音目。ここで写し取る
+        t += 0.5
+    # （パート, つまみ）を順に。値は 1 音（1.2 秒）で遅れが見える所を選ぶ
+    for ch, val in ((0, 0), (0, 48), (0, 80), (1, 64), (1, 80), (2, 80)):
+        ev += [(t, xg([0x08, ch, 0x17, val]))]
+        ev += note(ch, 62, 100, t + 0.2, 1.2)
+        t += 1.6
+    return [track(seq(ev))], t + 1.0
+
+
 def case_xghpf():
     """**パートの HPF**（`0A pp 20`。パートの塊の番地は 08 ではなく 0A）。
 
@@ -1650,6 +1745,32 @@ def case_xgsys():
     return [track(seq(ev))], t + 2.0
 
 
+def case_headrace():
+    """**曲頭にリセットと打鍵が同時に並ぶ**（issue #51）。
+
+    GM・GS・XG のリセットと、音色・つまみ・打鍵が全部 1 拍目の頭に詰まっている
+    曲は珍しくない。実機（firmware）は MIDI を順番に処理するので、打鍵はリセットが
+    終わってから鳴る。式だけの口は打鍵を自分でさばくため、待たせないと**先に鳴って
+    しまい、あとから終わる firmware のリセットに消される**（曲頭が数十 ms 鳴って、
+    以後ずっと無音になっていた）"""
+    ev = [(0.0, b'\xff\x51\x03' + struct.pack('>I', BPM120)[1:])]
+    # 3 つのリセットを隙間なく（報告と同じ形）
+    ev.append((0.0, sysex([0x7e, 0x7f, 0x09, 0x01, 0xf7])))                       # GM On
+    ev.append((0.0, sysex([0x41, 0x10, 0x42, 0x12, 0x40, 0x00, 0x7f, 0x00, 0x41, 0xf7])))  # GS
+    ev.append((0.0, XG_RESET))                                                     # XG On
+    # 同じ時刻に音色・音量・送り、そして打鍵。**1 声だけ**にしてある（音色ごとの
+    # 音量差が積み上がると、見たいもの＝曲頭が消えるかどうかが埋もれる。6.222）
+    ev.append((0.0, bytes([0xb0, 0x00, 0x00])))
+    ev.append((0.0, bytes([0xb0, 0x20, 0x00])))
+    ev.append((0.0, bytes([0xc0, 48])))                 # Strings
+    ev.append((0.0, bytes([0xb0, 0x07, 110])))
+    ev.append((0.0, bytes([0xb0, 0x5b, 60])))
+    ev += note(0, 60, 100, 0.0, 3.0)
+    # 落ち着いたころにもう一度（リセットの待ちが解けたあとも普通に鳴るか）
+    ev += note(0, 55, 100, 4.0, 1.5)
+    return [track(seq(ev))], 6.0
+
+
 def case_calshort():
     """**写し取りが足りないまま鳴らす**（doc/native-engine.md の 6.219）。
 
@@ -1683,6 +1804,7 @@ def case_calshort():
 CASES = {
     "piano":   case_piano,
     "calshort": case_calshort,
+    "headrace": case_headrace,
     "chord":   case_chord,
     "drums":   case_drums,
     "effects": case_effects,
@@ -1739,6 +1861,9 @@ CASES = {
     "xgmwvib": case_xgmwvib,
     "xgsys":   case_xgsys,
     "xgvibshort": case_xgvibshort,
+    "xgvibdly": case_xgvibdly,
+    "drumrev": case_drumrev,
+    "drumsfx": case_drumsfx,
 }
 
 

@@ -210,7 +210,9 @@ void panel::paint_editor(HDC dc, const char *status) const
 	text_in(dc, info, line1, TEXT, m_font_small, DT_LEFT | DT_TOP | DT_WORDBREAK);
 
 	RECT hint = scale(26, 288, 290, 60);
-	text_in(dc, hint, texts().editor_hint,
+	text_in(dc, hint, UI_TEXT(editor_hint, "Drag knobs up/down, or use the wheel.\n"
+                           "Sends XG parameter changes.\n"
+                           "Values are read back from the MU2000."),
 	        RGB(104, 109, 116), m_font_small, DT_LEFT | DT_TOP | DT_WORDBREAK);
 
 	if (status && status[0])
@@ -263,6 +265,13 @@ bool panel::press(int x, int y, bridge &br)
 		m_drag_x = x;
 		m_drag_y = y;
 		m_drag_from = int(m_volume_now * 127);   // 掴んだところからの相対で動かす
+		return true;
+
+	case spot_kind::adgain:
+		m_held = sp;
+		m_drag_x = x;
+		m_drag_y = y;
+		m_drag_from = int(m_adgain_now * 127);
 		return true;
 
 	case spot_kind::part:
@@ -323,6 +332,14 @@ bool panel::drag(int x, int y, bridge &br)
 		const int move = (std::abs(dy) > std::abs(dx)) ? dy : dx;
 		m_volume_now = std::clamp(m_drag_from / 127.0 + double(move) / span, 0.0, 1.0);
 		br.set_gain(float(m_volume_now));
+		return true;
+	}
+	if (m_held->kind == spot_kind::adgain) {
+		// 音量つまみと同じ動かし方。まだ音には効かせない
+		const int dx = x - m_drag_x, dy = m_drag_y - y;
+		const int span = std::max(1L, m_held->r.right - m_held->r.left);
+		const int move = (std::abs(dy) > std::abs(dx)) ? dy : dx;
+		m_adgain_now = std::clamp(m_drag_from / 127.0 + double(move) / span, 0.0, 1.0);
 		return true;
 	}
 	if (m_held->kind == spot_kind::knob) {
@@ -394,6 +411,10 @@ bool panel::wheel_at(int x, int y, int delta, bridge &br)
 		br.set_gain(float(m_volume_now));
 		return true;
 	}
+	if (sp && sp->kind == spot_kind::adgain) {
+		m_adgain_now = std::clamp(m_adgain_now + delta * 0.02, 0.0, 1.0);
+		return true;
+	}
 	if (sp && sp->kind == spot_kind::knob) {
 		int v = 0;
 		if (value_of(sp->ctl, v))
@@ -430,9 +451,9 @@ void panel::build_editor_spots()
 	}
 
 	m_spots.push_back({ spot_kind::action, mu2000::button::count, CTL_XG_RESET,
-	                    scale(26, 250, 130, 24), texts().editor_xg_reset, "" });
+	                    scale(26, 250, 130, 24), UI_TEXT(editor_xg_reset, "XG reset"), "" });
 	m_spots.push_back({ spot_kind::action, mu2000::button::count, CTL_ALL_OFF,
-	                    scale(162, 250, 150, 24), texts().editor_all_off, "" });
+	                    scale(162, 250, 150, 24), UI_TEXT(editor_all_off, "All notes off"), "" });
 }
 
 } // namespace ui
