@@ -14,7 +14,7 @@
 #                 (mingw-w64 が要る: brew install mingw-w64)
 
 # 音を作るのは重いので最適化を上げる。-O2 より 6% 速い
-CXXFLAGS ?= -std=c++20 -O3 -Wall -Wno-unused-variable -Wno-unused-but-set-variable
+CXXFLAGS ?= -std=c++20 -O3 -Wall -Wformat-security -Wno-unused-variable -Wno-unused-but-set-variable
 
 # ---- Platform ----------------------------------------------------------------
 #
@@ -190,7 +190,8 @@ ifeq ($(PLATFORM),windows)
 all: $(BUILD)/verify$(EXE) $(BUILD)/boot$(EXE) $(BUILD)/render$(EXE) \
      $(BUILD)/live$(EXE) $(BUILD)/midisend$(EXE) $(BUILD)/panel$(EXE) $(BUILD)/gui$(EXE) \
      $(BUILD)/statetest$(EXE) $(BUILD)/rec$(EXE) $(BUILD)/blocktime$(EXE) \
-     vst3 $(BUILD)/vst3probe$(EXE) clap $(BUILD)/clapprobe$(EXE)
+     vst3 $(BUILD)/vst3probe$(EXE) clap $(BUILD)/clapprobe$(EXE) \
+     vsti $(BUILD)/vstiprobe$(EXE)
 else ifeq ($(PLATFORM),linux)
 # Linux (issue #25). The windowed program (gui, SDL3 + Cairo) and the
 # headless plug-ins build here too (doc/porting-linux-gui.md)
@@ -312,7 +313,11 @@ $(BUILD)/imgui/%.o: %.cpp
 
 $(BUILD)/src/gui.o: CXXFLAGS += $(IMGUI_FLAGS)
 
-$(BUILD)/gui$(EXE): $(OBJS) $(BUILD)/src/mu2000.o $(BUILD)/src/smf.o $(UI_OBJS) $(PC_OBJS) $(BUILD)/src/gui.o
+# The app classes pull in app.h, whose editor headers want imgui.h
+$(BUILD)/src/ui/app_win.o: CXXFLAGS += $(IMGUI_FLAGS)
+$(BUILD)/src/ui/window_win.o: CXXFLAGS += $(IMGUI_FLAGS)
+
+$(BUILD)/gui$(EXE): $(OBJS) $(BUILD)/src/mu2000.o $(BUILD)/src/smf.o $(UI_OBJS) $(PC_OBJS) $(BUILD)/src/gui.o $(BUILD)/src/ui/app_win.o $(BUILD)/src/ui/window_win.o
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) -lwinmm -lole32 -lgdi32 -luser32 -lavrt -lcomdlg32 -lshell32 	       -ld3d11 -ldxgi -ld3dcompiler -ldwmapi -limm32
 
@@ -348,7 +353,7 @@ VST3_SDK_SRCS := 	third_party/vst3/pluginterfaces/base/funknown.cpp 	third_party
 
 VST3_SRCS := src/vst3/plugin.cpp src/vst3/engine.cpp src/vst3/iids.cpp src/vst3/automation.cpp \
              src/vst3/view.cpp src/vst3/view_win.cpp \
-             src/ui/panel.cpp src/ui/layout.cpp src/ui/svg.cpp src/ui/editor.cpp \
+             src/ui/panel.cpp src/ui/layout.cpp src/ui/svg.cpp src/ui/png.cpp src/ui/editor.cpp \
              src/ui/effects.cpp src/xg/model.cpp $(VST3_SDK_SRCS)
 VST3_OBJS := $(VST3_SRCS:%.cpp=$(BUILD)/vst3obj/%.o)
 
@@ -356,7 +361,14 @@ $(BUILD)/vst3obj/%.o: %.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(VST3_INC) $(IMGUI_FLAGS) -c -o $@ $<
 
-vst3: $(VST3_BIN)
+# 写真調のパネルの絵（art/real）を束の中へ。プラグインは自分の場所から
+# ../Resources/panel/panel.txt を探す（doc/panel-editing.md）
+VST3_PANEL := $(VST3_DIR)/Contents/Resources/panel/panel.txt
+vst3: $(VST3_BIN) $(VST3_PANEL)
+
+$(VST3_PANEL): $(wildcard art/real/*.png) art/real/panel.txt
+	@mkdir -p $(dir $@)
+	@cp -f art/real/*.png art/real/panel.txt $(dir $@)
 
 # PC で触る窓（一覧・エディタ）はプラグインからも開ける。gui.exe と同じ
 # ui::pc_window なので、ImGui と PC 側の絵を一式こちらにも入れる
@@ -372,7 +384,7 @@ $(VST3_BIN): $(OBJS) $(BUILD)/src/mu2000.o $(VST3_OBJS) $(PC_OBJS)
 # 既定の置き場へ入れる。管理者権限が要ることがある
 VST3_INSTALL ?= $(PROGRAMFILES)/Common Files/VST3
 
-install-vst3: $(VST3_BIN)
+install-vst3: $(VST3_BIN) $(VST3_PANEL)
 ifdef CROSS_WINDOWS
 ifeq ($(PROGRAMFILES),)
 	$(error CROSS=windows: there is no Program Files here -- pass VST3_INSTALL=<dir> to copy the bundle somewhere you can pick it up from)
@@ -402,7 +414,7 @@ endif
 #   make clap          build/S-MU2000.clap を作る（CLAP は DLL 1 本）
 #   make install-clap  それを CLAP の置き場へ複製する
 
-CLAP_BIN  := $(BUILD)/S-MU2000_rp.clap
+CLAP_BIN  := $(BUILD)/S-MU2000.clap
 CLAP_INC  := -I third_party/clap $(VST3_INC)
 CLAP_OBJS := $(BUILD)/clapobj/src/clap/plugin.o $(filter-out $(BUILD)/vst3obj/src/vst3/plugin.o,$(VST3_OBJS))
 
@@ -427,7 +439,41 @@ CLAP_INSTALL ?= $(PROGRAMFILES)/Common Files/CLAP
 install-clap: $(CLAP_BIN)
 	mkdir -p "$(CLAP_INSTALL)"
 	cp -f $(CLAP_BIN) "$(CLAP_INSTALL)/"
-	@echo "入れた: $(CLAP_INSTALL)/S-MU2000_rp.clap"
+	@echo "入れた: $(CLAP_INSTALL)/S-MU2000.clap"
+
+# ---- VST 2.4 instrument (Windows)
+#
+# The discontinued SDK is not used. src/vsti/vst2_abi.h declares only the
+# binary interface needed by this wrapper. The engine and panel are shared with
+# VST3 and CLAP.
+
+VSTI_BIN  := $(BUILD)/S-MU2000.dll
+VSTI_OBJS := $(BUILD)/vstiobj/src/vsti/plugin.o \
+             $(filter-out $(BUILD)/vst3obj/src/vst3/plugin.o,$(VST3_OBJS))
+
+$(BUILD)/vstiobj/%.o: %.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(VST3_INC) $(IMGUI_FLAGS) -c -o $@ $<
+
+vsti: $(VSTI_BIN)
+
+$(VSTI_BIN): $(OBJS) $(BUILD)/src/mu2000.o $(VSTI_OBJS) $(PC_OBJS)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -shared -o $@ $^ $(LDFLAGS) -lwinmm -lole32 -lgdi32 -luser32 -lavrt -lcomdlg32 -lshell32 -ld3d11 -ldxgi -ld3dcompiler -ldwmapi -limm32
+
+VSTI_INSTALL ?= $(PROGRAMFILES)/VstPlugins
+
+install-vsti: $(VSTI_BIN)
+	mkdir -p "$(VSTI_INSTALL)"
+	cp -f $(VSTI_BIN) "$(VSTI_INSTALL)/"
+	@echo "入れた: $(VSTI_INSTALL)/S-MU2000.dll"
+
+$(BUILD)/vstiprobe$(EXE): $(BUILD)/src/vsti/probe.o
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) -luser32
+
+vsti-probe: $(BUILD)/vstiprobe$(EXE) $(VSTI_BIN)
+	$(BUILD)/vstiprobe$(EXE) $(VSTI_BIN)
 
 # The Audio Unit is a macOS port; nothing to build here
 au install-au au-probe check-au:
@@ -490,6 +536,8 @@ LINUX_GUI_SRCS := src/ui/panel.cpp src/ui/layout.cpp src/ui/svg.cpp \
                   src/ui/player.cpp src/xg/model.cpp \
                   src/ui/xg_ui.cpp src/ui/fx_help.cpp src/ui/fx_icons.cpp \
                   src/ui/sdl_popup.cpp \
+                  src/ui/window_sdl.cpp \
+                  src/ui/app_linux.cpp \
                   src/ui/pc_window_linux.cpp \
                   src/ui/pc_editor.cpp src/ui/overview.cpp src/ui/fx_editor.cpp \
                   src/ui/part_shapes.cpp src/ui/master_editor.cpp
@@ -525,7 +573,7 @@ VST3_SDK_SRCS := \
 	third_party/vst3/pluginterfaces/base/ustring.cpp
 
 LINUX_PANEL_SRCS := src/compat/gdi_linux.cpp \
-              src/ui/panel.cpp src/ui/layout.cpp src/ui/svg.cpp src/ui/editor.cpp \
+              src/ui/panel.cpp src/ui/layout.cpp src/ui/svg.cpp src/ui/png.cpp src/ui/editor.cpp \
               src/ui/effects.cpp src/xg/model.cpp \
               src/ui/xg_ui.cpp src/ui/fx_help.cpp src/ui/fx_icons.cpp $(IMGUI_CORE)
 
@@ -538,7 +586,14 @@ $(BUILD)/vst3obj/%.o: %.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(VST3_INC) $(IMGUI_FLAGS) $(LINUX_SDL_CFLAGS) -c -o $@ $<
 
-vst3: $(VST3_BIN)
+# 写真調のパネルの絵（art/real）を束の中へ。プラグインは自分の場所から
+# ../Resources/panel/panel.txt を探す（doc/panel-editing.md）
+VST3_PANEL := $(VST3_DIR)/Contents/Resources/panel/panel.txt
+vst3: $(VST3_BIN) $(VST3_PANEL)
+
+$(VST3_PANEL): $(wildcard art/real/*.png) art/real/panel.txt
+	@mkdir -p $(dir $@)
+	@cp -f art/real/*.png art/real/panel.txt $(dir $@)
 
 $(VST3_BIN): $(OBJS) $(BUILD)/src/mu2000.o $(VST3_OBJS) $(IMGUI_SDL_OBJS)
 	@mkdir -p $(dir $@)
@@ -550,7 +605,7 @@ $(VST3_BIN): $(OBJS) $(BUILD)/src/mu2000.o $(VST3_OBJS) $(IMGUI_SDL_OBJS)
 
 VST3_INSTALL ?= $(HOME)/.vst3
 
-install-vst3: $(VST3_BIN)
+install-vst3: $(VST3_BIN) $(VST3_PANEL)
 	rm -rf "$(VST3_INSTALL)/S-MU2000.vst3"
 	mkdir -p "$(VST3_INSTALL)"
 	cp -r $(VST3_DIR) "$(VST3_INSTALL)/"
@@ -615,6 +670,17 @@ else # macOS
 #
 # The GUI additionally needs a window, which is AppKit (Cocoa) plus CoreText
 # for the panel's labels.
+#
+# packaging/auv3-app-Info.plist and packaging/auv3-appex-Info.plist both say
+# LSMinimumSystemVersion 11.0, so that is the floor this project has always
+# claimed. Saying the same thing to the compiler keeps the binaries honest: left
+# unset, the toolchain stamps whatever SDK is installed (27.2 at the time of
+# writing) into minos, and a VST3 or AU built on a new Mac then refuses to load
+# on the very machines the plists promise to support. Exported rather than added
+# to CXXFLAGS so the driver applies it to the link steps too, and to anything
+# the recipes shell out to.
+export MACOSX_DEPLOYMENT_TARGET := 11.0
+
 MAC_FRAMEWORKS := -framework CoreAudio -framework AudioToolbox \
                   -framework CoreMIDI -framework AudioUnit \
                   -framework CoreFoundation -framework CoreGraphics \
@@ -635,15 +701,14 @@ $(BUILD)/live$(EXE): $(OBJS) $(BUILD)/src/mu2000.o $(MAC_IO_OBJS) $(BUILD)/src/l
 # CoreGraphics and window_mac.mm fills the window in with AppKit
 # (doc/porting-macos.md).
 #
-# window_mac.mm is the one file compiled as Objective-C++: Cocoa's headers and
-# compat/gdi.h both want to define BOOL and Polygon, so they cannot be in the
-# same translation unit.
+# window_mac.mm is the one file compiled as Objective-C++.
 MAC_GUI_SRCS := src/ui/panel.cpp src/ui/editor.cpp src/ui/effects.cpp \
                 src/ui/png.cpp src/ui/layout.cpp src/ui/svg.cpp src/ui/player.cpp \
                 src/ui/audio_out_mac.cpp src/ui/audio_in_mac.cpp \
                 src/ui/midi_in_mac.cpp src/ui/midi_out_mac.cpp \
                 src/xg/model.cpp \
-                src/compat/gdi_mac.cpp src/ui/window_mac.mm src/gui_mac.cpp
+                src/compat/gdi_mac.cpp src/ui/window_mac.mm src/ui/app_mac.cpp \
+                src/gui_mac.cpp
 
 # PC editor (doc/pc-editor.md). The views are the same files as on Windows;
 # the window is AppKit + Metal (pc_window_mac.mm). imgui_impl_osx is not used
@@ -672,8 +737,11 @@ $(BUILD)/%.o: %.mm
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -fobjc-arc -c -o $@ $<
 
-# The macOS front end pulls in the editor's headers (fx_editor.h and friends),
-# which want imgui.h on the include path. Same reason as gui.o on Windows
+# The macOS front end pulls in the editor's headers (fx_editor.h and friends)
+# through app.h, which want imgui.h on the include path. Same reason as gui.o
+# on Windows -- and window_mac.mm too now, since it includes app.h directly
+$(BUILD)/src/ui/app_mac.o: CXXFLAGS += $(IMGUI_FLAGS)
+$(BUILD)/src/ui/window_mac.o: CXXFLAGS += $(IMGUI_FLAGS)
 $(BUILD)/src/gui_mac.o: CXXFLAGS += $(IMGUI_FLAGS)
 
 MAC_FRAMEWORKS += -framework Metal
@@ -688,8 +756,8 @@ $(BUILD)/gui$(EXE): $(OBJS) $(BUILD)/src/mu2000.o $(BUILD)/src/smf.o $(MAC_GUI_O
 # Contents/Info.plist declares what the package is. A host opens it with CFBundle
 # rather than dlopen and calls bundleEntry (end of plugin.cpp).
 
-VST3_DIR  := $(BUILD)/S-MU2000_rp.vst3
-VST3_BIN  := $(VST3_DIR)/Contents/MacOS/S-MU2000_rp
+VST3_DIR  := $(BUILD)/S-MU2000.vst3
+VST3_BIN  := $(VST3_DIR)/Contents/MacOS/S-MU2000
 VST3_INC  := -I third_party/vst3
 
 VST3_SDK_SRCS := \
@@ -707,7 +775,7 @@ VST3_SDK_SRCS := \
 # view_win.cpp in place of view_mac.mm)
 PANEL_VIEW_SRCS := src/vst3/view.cpp src/vst3/view_mac.mm
 PANEL_SRCS := src/compat/gdi_mac.cpp \
-              src/ui/panel.cpp src/ui/layout.cpp src/ui/svg.cpp src/ui/editor.cpp \
+              src/ui/panel.cpp src/ui/layout.cpp src/ui/svg.cpp src/ui/png.cpp src/ui/editor.cpp \
               src/ui/effects.cpp src/xg/model.cpp
 
 VST3_SRCS := src/vst3/plugin.cpp src/vst3/engine.cpp src/vst3/iids.cpp src/vst3/automation.cpp \
@@ -723,7 +791,14 @@ $(BUILD)/vst3obj/%.o: %.mm
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(VST3_INC) $(IMGUI_FLAGS) -fobjc-arc -c -o $@ $<
 
-vst3: $(VST3_BIN)
+# 写真調のパネルの絵（art/real）を束の中へ。プラグインは自分の場所から
+# ../Resources/panel/panel.txt を探す（doc/panel-editing.md）
+VST3_PANEL := $(VST3_DIR)/Contents/Resources/panel/panel.txt
+vst3: $(VST3_BIN) $(VST3_PANEL)
+
+$(VST3_PANEL): $(wildcard art/real/*.png) art/real/panel.txt
+	@mkdir -p $(dir $@)
+	@cp -f art/real/*.png art/real/panel.txt $(dir $@)
 
 # -bundle, not -shared: a VST3 is read with CFBundle, not dlopen
 # The overview/editor PC windows open from the plug-in too, so the ImGui
@@ -742,11 +817,11 @@ $(VST3_BIN): $(OBJS) $(BUILD)/src/mu2000.o $(VST3_OBJS) $(MAC_PC_OBJS)
 # Install into the default location. No admin rights needed on macOS
 VST3_INSTALL ?= $(HOME)/Library/Audio/Plug-Ins/VST3
 
-install-vst3: $(VST3_BIN)
-	rm -rf "$(VST3_INSTALL)/S-MU2000_rp.vst3"
+install-vst3: $(VST3_BIN) $(VST3_PANEL)
+	rm -rf "$(VST3_INSTALL)/S-MU2000.vst3"
 	mkdir -p "$(VST3_INSTALL)"
 	cp -r $(VST3_DIR) "$(VST3_INSTALL)/"
-	@echo "入れた: $(VST3_INSTALL)/S-MU2000_rp.vst3"
+	@echo "入れた: $(VST3_INSTALL)/S-MU2000.vst3"
 
 # ---- CLAP plug-in (macOS)
 #
@@ -754,8 +829,8 @@ install-vst3: $(VST3_BIN)
 # On macOS a CLAP is a bundle like the VST3: the binary in Contents/MacOS, found
 # through Contents/Info.plist. Not in `all` yet -- it has not been tried in a
 # macOS host
-CLAP_DIR  := $(BUILD)/S-MU2000_rp.clap
-CLAP_BIN  := $(CLAP_DIR)/Contents/MacOS/S-MU2000_rp
+CLAP_DIR  := $(BUILD)/S-MU2000.clap
+CLAP_BIN  := $(CLAP_DIR)/Contents/MacOS/S-MU2000
 CLAP_INC  := -I third_party/clap $(VST3_INC)
 CLAP_OBJS := $(BUILD)/clapobj/src/clap/plugin.o $(filter-out $(BUILD)/vst3obj/src/vst3/plugin.o,$(VST3_OBJS))
 
@@ -777,10 +852,10 @@ $(CLAP_BIN): $(OBJS) $(BUILD)/src/mu2000.o $(CLAP_OBJS) $(MAC_PC_OBJS)
 CLAP_INSTALL ?= $(HOME)/Library/Audio/Plug-Ins/CLAP
 
 install-clap: $(CLAP_BIN)
-	rm -rf "$(CLAP_INSTALL)/S-MU2000_rp.clap"
+	rm -rf "$(CLAP_INSTALL)/S-MU2000.clap"
 	mkdir -p "$(CLAP_INSTALL)"
 	cp -r $(CLAP_DIR) "$(CLAP_INSTALL)/"
-	@echo "入れた: $(CLAP_INSTALL)/S-MU2000_rp.clap"
+	@echo "入れた: $(CLAP_INSTALL)/S-MU2000.clap"
 
 # The same small CLAP host as on Windows (src/clap/probe.cpp opens the module
 # with dlopen here, so it wants the executable inside the bundle, not the
@@ -827,12 +902,15 @@ probe: $(BUILD)/vst3probe$(EXE) $(VST3_BIN)
 AU_DIR := $(BUILD)/S-MU2000.component
 AU_BIN := $(AU_DIR)/Contents/MacOS/S-MU2000
 
-# The editor is the VST3 view, so the AU carries that too: editor_mac.mm makes a
-# smu2000::vst3::plug_view and hands it to the host inside an NSView. Its own
-# files are plugin.cpp and editor_mac.mm; everything below them is the same panel
+# The editor is the VST3 view, so the AU carries that too: panel_nsview.mm makes
+# a smu2000::vst3::plug_view and hands it back inside an NSView, and the AUv3
+# asks that same file for the same view. Its own files are plugin.cpp and
+# editor_mac.mm, which is now only the AUv2 way of being asked; everything below
+# them is the same panel
 # iids.cpp is view.cpp's: it answers IPlugView's interface id, and view.cpp
 # refers to it even when the host on the other side is an AU rather than a VST3
 AU_SRCS := src/au/plugin.cpp src/au/editor_mac.mm src/vst3/engine.cpp src/vst3/iids.cpp \
+           src/vst3/panel_nsview.mm \
            $(PANEL_VIEW_SRCS) $(PANEL_SRCS) $(VST3_SDK_SRCS)
 AU_OBJS := $(AU_SRCS:%.cpp=$(BUILD)/vst3obj/%.o)
 AU_OBJS := $(AU_OBJS:%.mm=$(BUILD)/vst3obj/%.o)
@@ -895,9 +973,11 @@ AUV3_BIN   := $(AUV3_APPEX)/Contents/MacOS/S-MU2000AU
 AUV3_HOST  := $(AUV3_APP)/Contents/MacOS/S-MU2000
 
 # The sound engine is the same one VST3 uses (no VST3 types in it).
-# The UI is the same panel VST3 and AUv2 show (view_controller.mm hosts plug_view)
+# The UI is the same panel VST3 and AUv2 show, and literally the same editor:
+# panel_nsview.mm builds the NSView, view_controller.mm only puts it in the
+# NSViewController the AUv3 hands its host
 AUV3_SRCS := src/auv3/audio_unit.mm src/auv3/factory.mm src/auv3/view_controller.mm \
-             src/vst3/engine.cpp src/vst3/iids.cpp \
+             src/vst3/engine.cpp src/vst3/iids.cpp src/vst3/panel_nsview.mm \
              $(PANEL_VIEW_SRCS) $(PANEL_SRCS) $(VST3_SDK_SRCS)
 AUV3_OBJS := $(AUV3_SRCS:%.cpp=$(BUILD)/auv3obj/%.o)
 AUV3_OBJS := $(AUV3_OBJS:%.mm=$(BUILD)/auv3obj/%.o)
@@ -925,7 +1005,8 @@ AUV3_ROMS ?= roms
 AUV3_FLAGS := -fobjc-arc
 AUV3_FW    := -framework Foundation -framework AudioToolbox -framework AVFoundation \
               -framework CoreAudio -framework CoreMIDI -framework Cocoa -framework CoreAudioKit \
-              -framework Metal -framework QuartzCore
+              -framework Metal -framework QuartzCore \
+              -framework UniformTypeIdentifiers
 
 $(BUILD)/auv3obj/%.o: %.cpp
 	@mkdir -p $(dir $@)
@@ -1032,8 +1113,15 @@ regen:
 	$(PYTHON) tools/gen_sh7042_map.py $(MAME_SH7042)
 
 # Checks that need no ROMs; this is how the port is shown to hold together
-check: $(BUILD)/verify$(EXE)
+ifeq ($(PLATFORM),windows)
+CHECK_PLUGIN := $(BUILD)/vstiprobe$(EXE) $(VSTI_BIN)
+endif
+
+check: $(BUILD)/verify$(EXE) $(CHECK_PLUGIN)
 	$(BUILD)/verify$(EXE)
+ifeq ($(PLATFORM),windows)
+	$(BUILD)/vstiprobe$(EXE) $(VSTI_BIN)
+endif
 
 # 回帰試験。直したことで音が変わっていないかを見る。
 #
@@ -1065,4 +1153,4 @@ clean:
 # 別の場所を触りに行っていた）。だから build の下にある .d を全部拾う
 -include $(shell find $(BUILD) -name '*.d' 2>/dev/null)
 
-.PHONY: all clean regen check test test-update vst3 install-vst3 probe clap install-clap au install-au au-probe check-au
+.PHONY: all clean regen check test test-update vst3 install-vst3 probe clap install-clap vsti install-vsti vsti-probe au install-au au-probe check-au
