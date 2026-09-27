@@ -1063,12 +1063,8 @@ tresult PLUGIN_API mu_plugin::process(ProcessData &data)
 				// 出力レベルは音源に流さない。外で掛ける。最後の値だけ見る
 				int32 off = 0;
 				ParamValue v = 0.0;
-
-				// REAPER PC offset暫定措置
-				int32 ignoredOff = 0;
-
 				if (pq->getPointCount() > 0 &&
-				    pq->getPoint(pq->getPointCount() - 1, ignoredOff, v) == kResultOk)
+				    pq->getPoint(pq->getPointCount() - 1, off, v) == kResultOk)
 					m_engine.panel().set_gain(float(std::clamp(v, 0.0, 1.0)));
 				continue;
 			}
@@ -1085,7 +1081,11 @@ tresult PLUGIN_API mu_plugin::process(ProcessData &data)
 			for (int32 p = 0; p < np; p++) {
 				int32 off = 0;
 				ParamValue v = 0.0;
-				if (pq->getPoint(p, off, v) != kResultOk)
+
+				// REAPER PC offset暫定措置
+				int32 ignoredOff = 0;
+
+				if (pq->getPoint(p, ignoredOff, v) != kResultOk)
 					continue;
 				m_value[slot] = v;
 				// ここで「前と同じ値だから」と捨ててはいけない。RPN/NRPN は
