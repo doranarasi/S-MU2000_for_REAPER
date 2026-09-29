@@ -12,6 +12,8 @@ project(S-MU2000 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# Non-literal printf formats are bugs (translated strings must go through "%s").
+add_compile_options(-Wformat-security)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
@@ -94,7 +96,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     third_party/imgui/imgui_widgets.cpp)
   set(LINUX_PANEL_SRCS
     src/compat/gdi_linux.cpp
-    src/ui/panel.cpp src/ui/layout.cpp src/ui/svg.cpp src/ui/editor.cpp
+    src/ui/panel.cpp src/ui/layout.cpp src/ui/svg.cpp src/ui/png.cpp src/ui/editor.cpp
     src/ui/effects.cpp src/xg/model.cpp
     src/ui/xg_ui.cpp src/ui/fx_help.cpp src/ui/fx_icons.cpp
     ${IMGUI_CORE})
@@ -111,6 +113,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   set_target_properties(S-MU2000-vst3 PROPERTIES
     PREFIX "" SUFFIX ".so" OUTPUT_NAME "S-MU2000"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/S-MU2000.vst3/Contents/x86_64-linux")
+  # the photo-like panel art goes in the bundle; the plugin looks for
+  # ../Resources/panel/panel.txt from where it is loaded
+  file(GLOB REAL_PANEL_FILES "${CMAKE_SOURCE_DIR}/art/real/*.png" "${CMAKE_SOURCE_DIR}/art/real/panel.txt")
+  add_custom_command(TARGET S-MU2000-vst3 POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/S-MU2000.vst3/Contents/Resources/panel"
+    COMMAND ${CMAKE_COMMAND} -E copy ${REAL_PANEL_FILES} "${CMAKE_BINARY_DIR}/S-MU2000.vst3/Contents/Resources/panel/")
 
   add_library(S-MU2000-clap MODULE
     src/clap/plugin.cpp src/vst3/engine.cpp src/vst3/iids.cpp
@@ -143,6 +151,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
       src/ui/player.cpp src/xg/model.cpp
       src/ui/xg_ui.cpp src/ui/fx_help.cpp src/ui/fx_icons.cpp
       src/ui/sdl_popup.cpp
+      src/ui/window_sdl.cpp
+      src/ui/app_linux.cpp
       src/ui/pc_window_linux.cpp
       src/ui/pc_editor.cpp src/ui/overview.cpp src/ui/fx_editor.cpp
       src/ui/part_shapes.cpp src/ui/master_editor.cpp
